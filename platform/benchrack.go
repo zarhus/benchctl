@@ -92,10 +92,9 @@ const remoteReadback = "/data/readback.bin"
 
 var boards = map[string]board{
 	"asrock-turin": {
-		host: targetCfg{chip: "W25Q256JV_Q", voltage: "3.3V", sizeBytes: 32 * 1024 * 1024, muxSelect: "low", enable: gpioEnHost},
-		bmc:  targetCfg{chip: "", voltage: "3.3V", sizeBytes: 64 * 1024 * 1024, muxSelect: "high", enable: gpioEnBMC},
-		// The Turin demo uses a shared SPI Vcc rail, so no per-flash switch.
-		powerSwitches: false,
+		host:          targetCfg{chip: "W25Q256JV_Q", voltage: "3.3V", sizeBytes: 32 * 1024 * 1024, muxSelect: "low", enable: gpioEnHost},
+		bmc:           targetCfg{chip: "", voltage: "3.3V", sizeBytes: 64 * 1024 * 1024, muxSelect: "high", enable: gpioEnBMC},
+		powerSwitches: true,
 		// TODO(bring-up): confirm the mux-select polarity against the hardware.
 		// ser2net.yaml maps /dev/ttyS1 (115200n81) to telnet port 13541.
 		console: consoleCfg{port: 13541},

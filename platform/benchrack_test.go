@@ -237,9 +237,9 @@ func TestBenchRackFlashHostSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Energize order: voltage, mux select, mux enable, Vcc, lines (no switch:
-	// powerSwitches off).
-	want := []int{gpioSpiVoltage, gpioMuxSelect, gpioMuxEnable, gpioSpiVcc, gpioSpiLines}
+	// Energize order: voltage, mux select, mux enable, host load switch, Vcc,
+	// lines.
+	want := []int{gpioSpiVoltage, gpioMuxSelect, gpioMuxEnable, gpioEnHost, gpioSpiVcc, gpioSpiLines}
 	var got []int
 	// Reconstruct the energize prefix: take sets until SPI lines is first turned on.
 	for _, s := range g.sets {
@@ -251,7 +251,7 @@ func TestBenchRackFlashHostSequence(t *testing.T) {
 	if len(got) < len(want) {
 		t.Fatalf("energize sets = %v, want to include %v", got, want)
 	}
-	// The last four before (and including) lines-on must be the energize order.
+	// The last six before (and including) lines-on must be the energize order.
 	tail := got[len(got)-len(want):]
 	for i := range want {
 		if tail[i] != want[i] {
