@@ -79,11 +79,13 @@ type Status struct {
 // control mechanism the platform provides.
 type Platform interface {
 	PowerState() (PowerStatus, error)
-	SetPower(Power) error // polls until the requested state is reached
-	PowerReset() error    // power-reset the host, polls until it is back on
-	HardReset() error     // force a host reset through the platform's low-level path
-	Console() error       // attach to the host serial console, detach on exit
-	Flash(t FlashTarget, fw string, force bool) error
+	SetPower(Power) error                          // polls until the requested state is reached
+	PowerReset() error                             // power-reset the host, polls until it is back on
+	HardReset() error                              // force a host reset through the platform's low-level path
+	Console() error                                // attach to the host serial console, detach on exit
+	FlashProbe(t FlashTarget) error                // detect and report the flash chip
+	FlashRead(t FlashTarget, outPath string) error // read the flash into outPath
+	FlashWrite(t FlashTarget, fw string, force bool) error
 	FlashStatus(t FlashTarget) (Status, error)
 	FlashAbort(t FlashTarget) error
 }

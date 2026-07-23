@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package exec runs bench commands, either locally (when the bench is the local
-// host) or over SSH from a workstation. It also copies firmware to the bench for
-// remote flashing.
+// host) or over SSH from a workstation. It also copies firmware to and from the
+// bench for remote flashing.
 package exec
 
 import (
@@ -101,5 +101,13 @@ func scpArgv(target Target, local, remotePath string) []string {
 	argv := []string{"sshpass", "-p", target.Password, "scp"}
 	argv = append(argv, sshOpts...)
 	argv = append(argv, local, target.User+"@"+target.Host+":"+remotePath)
+	return argv
+}
+
+// scpFromArgv builds the local argv that copies remotePath on the bench to local.
+func scpFromArgv(target Target, remotePath, local string) []string {
+	argv := []string{"sshpass", "-p", target.Password, "scp"}
+	argv = append(argv, sshOpts...)
+	argv = append(argv, target.User+"@"+target.Host+":"+remotePath, local)
 	return argv
 }

@@ -90,3 +90,19 @@ func TestPushLocalReturnsSamePath(t *testing.T) {
 		t.Errorf("local Push cleanup returned error: %v", err)
 	}
 }
+
+func TestPullLocalReturnsSamePath(t *testing.T) {
+	runner := &CmdRunner{Target: Target{Host: "localhost"}}
+
+	local, fetch, err := runner.Pull("/local/dump.bin", "/data/readback.bin")
+	if err != nil {
+		t.Fatalf("Pull returned error: %v", err)
+	}
+	if local != "/local/dump.bin" {
+		t.Errorf("local Pull path = %q, want the local path unchanged", local)
+	}
+	// Fetch must be a no-op that succeeds: nothing was copied.
+	if err := fetch(); err != nil {
+		t.Errorf("local Pull fetch returned error: %v", err)
+	}
+}

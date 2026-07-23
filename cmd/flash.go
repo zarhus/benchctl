@@ -11,20 +11,25 @@ import (
 	"github.com/zarhus/benchctl/platform"
 )
 
-// parseFlashTarget maps an optional [host|bmc] argument to a FlashTarget,
-// defaulting to host when no argument is given.
-func parseFlashTarget(args []string) (platform.FlashTarget, error) {
-	if len(args) == 0 {
-		return platform.FlashHost, nil
-	}
-	switch args[0] {
+// flashTargetFromName maps a required host|bmc argument to a FlashTarget.
+func flashTargetFromName(name string) (platform.FlashTarget, error) {
+	switch name {
 	case "host":
 		return platform.FlashHost, nil
 	case "bmc":
 		return platform.FlashBMC, nil
 	default:
-		return 0, fmt.Errorf("unknown flash target %q (want host or bmc)", args[0])
+		return 0, fmt.Errorf("unknown flash target %q (want host or bmc)", name)
 	}
+}
+
+// parseFlashTarget maps an optional [host|bmc] argument to a FlashTarget,
+// defaulting to host when no argument is given. Used by status and abort.
+func parseFlashTarget(args []string) (platform.FlashTarget, error) {
+	if len(args) == 0 {
+		return platform.FlashHost, nil
+	}
+	return flashTargetFromName(args[0])
 }
 
 func flashCmd() *cobra.Command {
@@ -33,31 +38,52 @@ func flashCmd() *cobra.Command {
 		Short: "Flash firmware and manage updates",
 	}
 
-	var hostForce bool
-	host := &cobra.Command{
-		Use:   "host <firmware>",
-		Short: "Flash the host boot flash",
+	probe := &cobra.Command{
+		Use:   "probe <host|bmc>",
+		Short: "Detect and print the flash chip",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := flashTargetFromName(args[0])
+			if err != nil {
+				return err
+			}
 			return withPlatform(func(p platform.Platform) error {
-				return p.Flash(platform.FlashHost, args[0], hostForce)
+				return p.FlashProbe(target)
 			})
 		},
 	}
-	host.Flags().BoolVar(&hostForce, "force", false, "skip the firmware size check")
 
-	var bmcForce bool
-	bmc := &cobra.Command{
-		Use:   "bmc <firmware>",
-		Short: "Flash the BMC flash (where the platform supports it)",
-		Args:  cobra.ExactArgs(1),
+	read := &cobra.Command{
+		Use:   "read <host|bmc> <outfile>",
+		Short: "Read the flash into a file",
+		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := flashTargetFromName(args[0])
+			if err != nil {
+				return err
+			}
 			return withPlatform(func(p platform.Platform) error {
-				return p.Flash(platform.FlashBMC, args[0], bmcForce)
+				return p.FlashRead(target, args[1])
 			})
 		},
 	}
-	bmc.Flags().BoolVar(&bmcForce, "force", false, "skip the firmware size check")
+
+	var writeForce bool
+	write := &cobra.Command{
+		Use:   "write <host|bmc> <firmware>",
+		Short: "Write firmware to the flash",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := flashTargetFromName(args[0])
+			if err != nil {
+				return err
+			}
+			return withPlatform(func(p platform.Platform) error {
+				return p.FlashWrite(target, args[1], writeForce)
+			})
+		},
+	}
+	write.Flags().BoolVar(&writeForce, "force", false, "skip the firmware size check")
 
 	status := &cobra.Command{
 		Use:   "status [host|bmc]",
@@ -94,6 +120,6 @@ func flashCmd() *cobra.Command {
 		},
 	}
 
-	flash.AddCommand(host, bmc, status, abort)
+	flash.AddCommand(probe, read, write, status, abort)
 	return flash
 }

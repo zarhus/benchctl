@@ -13,8 +13,8 @@ import (
 	"strings"
 )
 
-// Runner runs commands on a bench and copies firmware to it. The driver depends
-// on this interface so it can be tested with a fake.
+// Runner runs commands on a bench and copies firmware to and from it. The driver
+// depends on this interface so it can be tested with a fake.
 type Runner interface {
 	// Run executes argv on the bench and returns its standard output. The error,
 	// when non-nil, includes the command and its standard error.
@@ -32,6 +32,11 @@ type Runner interface {
 	// it is a no-op that returns localPath (remotePath is ignored) and a cleanup
 	// that does nothing.
 	Push(localPath, remotePath string) (path string, cleanup func() error, err error)
+	// Pull arranges for a file the bench produces to reach localPath. It returns
+	// the path the bench command should write to (localPath when local, remotePath
+	// when remote) plus a fetch function that copies the file to localPath after
+	// the command runs (a no-op when local) and removes the remote temp.
+	Pull(localPath, remotePath string) (path string, fetch func() error, err error)
 	// Host reports the bench host the runner reaches, so a driver can address a
 	// second control surface on the same host (e.g. a REST API). It is
 	// "localhost" (or "") when commands run locally.
@@ -135,4 +140,23 @@ func (runner *CmdRunner) Push(localPath, remotePath string) (string, func() erro
 		return err
 	}
 	return remotePath, cleanup, nil
+}
+
+func (runner *CmdRunner) Pull(localPath, remotePath string) (string, func() error, error) {
+	if runner.Target.IsLocal() {
+		return localPath, func() error { return nil }, nil
+	}
+	fetch := func() error {
+		argv := scpFromArgv(runner.Target, remotePath, localPath)
+		runner.trace(argv)
+		cmd := exec.Command(argv[0], argv[1:]...)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("scp %s: %w: %s", remotePath, err, strings.TrimSpace(stderr.String()))
+		}
+		_, err := runner.Run("rm", "-f", remotePath)
+		return err
+	}
+	return remotePath, fetch, nil
 }

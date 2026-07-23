@@ -16,6 +16,7 @@ type fakeRunner struct {
 	calls       [][]string
 	interactive [][]string
 	pushed      bool
+	pulled      bool
 	streamOut   string // canned stdout for Stream
 	streamErr   error  // result of the Stream wait function
 	host        string // reported by Host()
@@ -44,5 +45,10 @@ func (fake *fakeRunner) Stream(argv ...string) (io.ReadCloser, func() error, err
 
 func (fake *fakeRunner) Push(localPath, remotePath string) (string, func() error, error) {
 	fake.pushed = true
+	return remotePath, func() error { return nil }, nil
+}
+
+func (fake *fakeRunner) Pull(localPath, remotePath string) (string, func() error, error) {
+	fake.pulled = true
 	return remotePath, func() error { return nil }, nil
 }

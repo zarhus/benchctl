@@ -233,7 +233,7 @@ func TestBenchRackFlashHostSequence(t *testing.T) {
 	b := testBenchRack(t, runner, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
 
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -290,7 +290,7 @@ func TestBenchRackFlashMuxEnableInterlock(t *testing.T) {
 	}}
 	b := testBenchRack(t, &fakeRunner{}, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -329,13 +329,89 @@ func TestBenchRackFlashBMCOmitsChip(t *testing.T) {
 	b := testBenchRack(t, runner, g)
 	fw := writeSized(t, int(b.board.bmc.sizeBytes))
 
-	if err := b.Flash(FlashBMC, fw, false); err != nil {
+	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, call := range runner.calls {
 		if len(call) > 0 && call[0] == "flashrom" && strings.Contains(strings.Join(call, " "), "-c ") {
 			t.Errorf("BMC flashrom argv = %q, should not pass -c (auto-detect)", strings.Join(call, " "))
 		}
+	}
+}
+
+func TestBenchRackFlashProbeDetectsWithoutReadOrWrite(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	runner := &fakeRunner{streamOut: "Found chip\n"}
+	b := testBenchRack(t, runner, g)
+
+	if err := b.FlashProbe(FlashHost); err != nil {
+		t.Fatal(err)
+	}
+
+	var flashArgv []string
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "flashrom" {
+			flashArgv = call
+		}
+	}
+	if flashArgv == nil {
+		t.Fatal("flashrom was not run")
+	}
+	joined := strings.Join(flashArgv, " ")
+	if strings.Contains(joined, "-r ") || strings.Contains(joined, "-w ") {
+		t.Errorf("probe flashrom argv = %q, should neither read nor write", joined)
+	}
+	if !strings.Contains(joined, "-c "+b.board.host.chip) {
+		t.Errorf("probe flashrom argv = %q, want -c %s for host", joined, b.board.host.chip)
+	}
+	if runner.pushed || runner.pulled {
+		t.Errorf("probe pushed=%v pulled=%v, want neither (no image transfer)", runner.pushed, runner.pulled)
+	}
+}
+
+func TestBenchRackFlashReadPullsImageBack(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, g)
+	out := filepath.Join(t.TempDir(), "dump.bin")
+
+	if err := b.FlashRead(FlashHost, out); err != nil {
+		t.Fatal(err)
+	}
+
+	var flashArgv []string
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "flashrom" {
+			flashArgv = call
+		}
+	}
+	if flashArgv == nil {
+		t.Fatal("flashrom was not run")
+	}
+	joined := strings.Join(flashArgv, " ")
+	if !strings.Contains(joined, "-r ") || strings.Contains(joined, "-w ") {
+		t.Errorf("read flashrom argv = %q, want -r and not -w", joined)
+	}
+	if !runner.pulled {
+		t.Error("read did not pull the image back from the bench")
+	}
+
+	// The bus is de-energized afterward: lines high-z and the mux disabled.
+	lastState := func(id int) string {
+		state := ""
+		for _, s := range g.sets {
+			if s.id == id {
+				state = s.state
+			}
+		}
+		return state
+	}
+	if lastState(gpioSpiLines) != "high-z" || lastState(gpioMuxEnable) != "high" {
+		t.Errorf("after read lines=%q mux=%q, want lines high-z and mux disabled", lastState(gpioSpiLines), lastState(gpioMuxEnable))
 	}
 }
 
@@ -349,7 +425,7 @@ func TestBenchRackFlashExportsEGPAOnFirstRun(t *testing.T) {
 	}}
 	b := testBenchRack(t, &fakeRunner{}, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -378,7 +454,7 @@ func TestBenchRackFlashParksLiveBusOff(t *testing.T) {
 	}}
 	b := testBenchRack(t, &fakeRunner{}, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 	// First action on Vcc and lines must be an off (high-z), before mux select.
@@ -407,7 +483,7 @@ func TestBenchRackFlashEnablesSwitchWhenConfigured(t *testing.T) {
 	b := testBenchRack(t, &fakeRunner{}, g)
 	b.board.powerSwitches = true
 	fw := writeSized(t, int(b.board.host.sizeBytes))
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 	// The host branch switch is enabled high at some point during the flash.
@@ -429,11 +505,11 @@ func TestBenchRackFlashSizeCheck(t *testing.T) {
 	b := testBenchRack(t, &fakeRunner{}, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes)-1)
 
-	if err := b.Flash(FlashHost, fw, false); err == nil {
-		t.Fatal("Flash should reject a wrong-sized image without --force")
+	if err := b.FlashWrite(FlashHost, fw, false); err == nil {
+		t.Fatal("FlashWrite should reject a wrong-sized image without --force")
 	}
-	if err := b.Flash(FlashHost, fw, true); err != nil {
-		t.Errorf("Flash --force should skip the size check, got %v", err)
+	if err := b.FlashWrite(FlashHost, fw, true); err != nil {
+		t.Errorf("FlashWrite --force should skip the size check, got %v", err)
 	}
 }
 
@@ -445,8 +521,8 @@ func TestBenchRackFlashRestoresOnError(t *testing.T) {
 	b := testBenchRack(t, runner, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
 
-	if err := b.Flash(FlashHost, fw, false); err == nil {
-		t.Fatal("Flash should surface a flashrom failure")
+	if err := b.FlashWrite(FlashHost, fw, false); err == nil {
+		t.Fatal("FlashWrite should surface a flashrom failure")
 	}
 	// The bus must be de-energized even on failure: last Vcc and lines sets off.
 	lastState := func(id int) string {

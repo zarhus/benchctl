@@ -27,7 +27,11 @@ func (fake *fakePlatform) SetPower(platform.Power) error             { return ni
 func (fake *fakePlatform) PowerReset() error                         { fake.softReset = true; return nil }
 func (fake *fakePlatform) HardReset() error                          { fake.hardReset = true; return nil }
 func (fake *fakePlatform) Console() error                            { return nil }
-func (fake *fakePlatform) Flash(platform.FlashTarget, string, bool) error {
+func (fake *fakePlatform) FlashProbe(platform.FlashTarget) error     { return fake.flashErr }
+func (fake *fakePlatform) FlashRead(platform.FlashTarget, string) error {
+	return fake.flashErr
+}
+func (fake *fakePlatform) FlashWrite(platform.FlashTarget, string, bool) error {
 	return fake.flashErr
 }
 func (fake *fakePlatform) FlashStatus(platform.FlashTarget) (platform.Status, error) {
@@ -78,11 +82,11 @@ func TestFlashStatusPrintsStateNotID(t *testing.T) {
 	}
 }
 
-func TestFlashBMCPropagatesNotImplemented(t *testing.T) {
+func TestFlashWriteBMCPropagatesNotImplemented(t *testing.T) {
 	withFakePlatform(t, &fakePlatform{flashErr: platform.ErrNotImplemented})
-	_, err := run(t, "flash", "bmc", "fw.bin")
+	_, err := run(t, "flash", "write", "bmc", "fw.bin")
 	if !errors.Is(err, platform.ErrNotImplemented) {
-		t.Errorf("flash bmc error = %v, want ErrNotImplemented", err)
+		t.Errorf("flash write bmc error = %v, want ErrNotImplemented", err)
 	}
 }
 
@@ -110,7 +114,7 @@ func TestCommandTreeWired(t *testing.T) {
 	root := newRootCmd()
 	want := map[string][]string{
 		"power": {"on", "off", "status", "reset"},
-		"flash": {"host", "bmc", "status", "abort"},
+		"flash": {"probe", "read", "write", "status", "abort"},
 	}
 	for parent, subs := range want {
 		parentCmd, _, err := root.Find([]string{parent})

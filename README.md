@@ -33,16 +33,17 @@ architecture from any host with no C toolchain, through the usual `GOOS` and
 ## Usage
 
 ```sh
-bin/benchctl power on                    power on, wait until the host is on
-bin/benchctl power off                   power off, wait until the host is off
-bin/benchctl power status                print the current power state
-bin/benchctl power reset                 power-cycle off then on, wait until back on
-bin/benchctl power reset --hard          hard-reset the host (mechanism varies by platform)
-bin/benchctl console                     attach to the host serial console
-bin/benchctl flash host <fw> [--force]   flash the host boot flash
-bin/benchctl flash bmc  <fw> [--force]   flash the BMC flash (where supported)
-bin/benchctl flash status [host|bmc]     show the update status (default host)
-bin/benchctl flash abort  [host|bmc]     abort a stuck or stale update (default host)
+bin/benchctl power on                                 power on, wait until the host is on
+bin/benchctl power off                                power off, wait until the host is off
+bin/benchctl power status                             print the current power state
+bin/benchctl power reset                              power-cycle off then on, wait until back on
+bin/benchctl power reset --hard                       hard-reset the host (mechanism varies by platform)
+bin/benchctl console                                  attach to the host serial console
+bin/benchctl flash probe <host|bmc>                   detect and print the flash chip
+bin/benchctl flash read  <host|bmc> <file>            read the flash into <file>
+bin/benchctl flash write <host|bmc> <fw> [--force]    write firmware to the flash
+bin/benchctl flash status [host|bmc]                  show the update status (default host)
+bin/benchctl flash abort  [host|bmc]                  abort a stuck or stale update (default host)
 ```
 
 ### Selecting the bench
@@ -67,7 +68,7 @@ to `asrock-turin`.
 ```sh
 # From a PC:
 bin/benchctl --host rte.local power status
-bin/benchctl --host rte.local flash host ./image.bin
+bin/benchctl --host rte.local flash write host ./image.bin
 
 # On the bench:
 bin/benchctl power status
@@ -75,10 +76,12 @@ bin/benchctl power status
 
 ### Remote flashing
 
-When you flash from a PC, `benchctl` checks the firmware size locally, copies
+When you write from a PC, `benchctl` checks the firmware size locally, copies
 the file to a temporary path on the bench with `scp`, runs the blocking flash,
-confirms it succeeded, and removes the temporary file. On the bench the file is
-already local and no copy happens.
+confirms it succeeded, and removes the temporary file. A `read` runs the other
+way: `flashrom` writes the image to a temporary path on the bench, then
+`benchctl` copies it back to your file and removes the temporary file. On the
+bench the file is already local and no copy happens.
 
 ## Platforms
 

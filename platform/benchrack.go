@@ -18,7 +18,7 @@ import (
 
 // BenchRack is the RTE-based bench. The driver controls GPIO, the SPI mux, and
 // power over the RTE REST API, and runs flashrom over SSH. flashrom runs
-// synchronously inside a Flash call, so there is no update state to query or
+// synchronously within a flash command, so there is no update state to query or
 // abort between invocations. FlashStatus and FlashAbort report ErrNotImplemented.
 
 func init() {
@@ -78,12 +78,17 @@ type board struct {
 
 const defaultBoard = "asrock-turin"
 
-// remoteFirmware is where Flash stages the image on the RTE. It lives on /data
-// (persistent storage) rather than /var/tmp (tmpfs): the RTE has little free
-// RAM, and flashrom already holds roughly twice the flash size in memory to
+// remoteFirmware is where FlashWrite stages the image on the RTE. It lives on
+// /data (persistent storage) rather than /var/tmp (tmpfs): the RTE has little
+// free RAM, and flashrom already holds roughly twice the flash size in memory to
 // write and verify, so staging the image in RAM as well can exhaust it on a
 // 64 MB flash. The name is fixed, so each flash overwrites the last.
 const remoteFirmware = "/data/rom.bin"
+
+// remoteReadback is where FlashRead has flashrom write the chip image on the RTE
+// before it is copied back to the caller. It lives on /data for the same reason
+// as remoteFirmware, and its fixed name means each read overwrites the last.
+const remoteReadback = "/data/readback.bin"
 
 var boards = map[string]board{
 	"asrock-turin": {
@@ -252,7 +257,10 @@ func (bench *benchRack) Console() error {
 	return bench.runner.RunInteractive("telnet", "localhost", port)
 }
 
-func (bench *benchRack) Flash(target FlashTarget, fw string, force bool) error {
+// withFlashBus parks the bus, powers the board off so the RTE drives the flash,
+// energizes the selected branch, and runs fn with that flash on the SPI bus. It
+// always de-energizes the bus afterward, even when fn fails.
+func (bench *benchRack) withFlashBus(target FlashTarget, fn func(tgt targetCfg) error) error {
 	if bench.boardErr != nil {
 		return bench.boardErr
 	}
@@ -265,14 +273,6 @@ func (bench *benchRack) Flash(target FlashTarget, fw string, force bool) error {
 	// mux, and export the E_GPA pins as outputs if this is the first run.
 	if err := bench.parkOff(); err != nil {
 		return err
-	}
-
-	info, err := os.Stat(fw)
-	if err != nil {
-		return err
-	}
-	if info.Size() != tgt.sizeBytes && !force {
-		return fmt.Errorf("%s is %d bytes, expected %d. Use --force to override", fw, info.Size(), tgt.sizeBytes)
 	}
 
 	// The board is off, so the RTE powers the flash.
@@ -312,13 +312,51 @@ func (bench *benchRack) Flash(target FlashTarget, fw string, force bool) error {
 	}
 	time.Sleep(bench.settle)
 
-	remote, cleanup, err := bench.runner.Push(fw, remoteFirmware)
+	return fn(tgt)
+}
+
+func (bench *benchRack) FlashProbe(target FlashTarget) error {
+	return bench.withFlashBus(target, func(tgt targetCfg) error {
+		return bench.flashrom(flashProbe, tgt.chip, "")
+	})
+}
+
+func (bench *benchRack) FlashRead(target FlashTarget, outPath string) error {
+	return bench.withFlashBus(target, func(tgt targetCfg) error {
+		remote, fetch, err := bench.runner.Pull(outPath, remoteReadback)
+		if err != nil {
+			return err
+		}
+		if err := bench.flashrom(flashRead, tgt.chip, remote); err != nil {
+			return err
+		}
+		return fetch()
+	})
+}
+
+func (bench *benchRack) FlashWrite(target FlashTarget, fw string, force bool) error {
+	if bench.boardErr != nil {
+		return bench.boardErr
+	}
+	tgt, err := bench.target(target)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = cleanup() }()
-
-	return bench.flashrom(remote, tgt.chip)
+	info, err := os.Stat(fw)
+	if err != nil {
+		return err
+	}
+	if info.Size() != tgt.sizeBytes && !force {
+		return fmt.Errorf("%s is %d bytes, expected %d. Use --force to override", fw, info.Size(), tgt.sizeBytes)
+	}
+	return bench.withFlashBus(target, func(tgt targetCfg) error {
+		remote, cleanup, err := bench.runner.Push(fw, remoteFirmware)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = cleanup() }()
+		return bench.flashrom(flashWrite, tgt.chip, remote)
+	})
 }
 
 // parkOff drives the load-switch enables and the SPI bus to a known-off state.
@@ -363,16 +401,36 @@ func (bench *benchRack) deenergize() {
 	_ = bench.gpio.Set(gpioSpiVoltage, "high-z", 0)
 }
 
-// flashrom runs the write over SSH, echoing output as it streams, and fails if
-// flashrom exits non-zero.
-func (bench *benchRack) flashrom(remote, chip string) error {
+// flashOp is a flashrom operation: probe (detect the chip only), read, or write.
+type flashOp int
+
+const (
+	flashProbe flashOp = iota
+	flashRead
+	flashWrite
+)
+
+// flashrom runs one flashrom operation over SSH, echoing output as it streams,
+// and fails if flashrom exits non-zero. file is the bench-side image path for a
+// read or a write, and is ignored for a probe.
+func (bench *benchRack) flashrom(op flashOp, chip, file string) error {
 	argv := []string{"flashrom", "-p", fmt.Sprintf("linux_spi:dev=%s,spispeed=%d", bench.spiDev, bench.spiSpeed)}
 	if chip != "" {
 		argv = append(argv, "-c", chip)
 	}
-	argv = append(argv, "-w", remote)
+	var start, done string
+	switch op {
+	case flashProbe:
+		start, done = "Probing flash...", "Probe complete."
+	case flashRead:
+		argv = append(argv, "-r", file)
+		start, done = "Reading flash...", "Read complete."
+	case flashWrite:
+		argv = append(argv, "-w", file)
+		start, done = "Flashing...", "Flash complete."
+	}
 
-	fmt.Fprintln(bench.progress, "Flashing...")
+	fmt.Fprintln(bench.progress, start)
 	stdout, wait, err := bench.runner.Stream(argv...)
 	if err != nil {
 		return err
@@ -387,7 +445,7 @@ func (bench *benchRack) flashrom(remote, chip string) error {
 	if err := wait(); err != nil {
 		return fmt.Errorf("flashrom failed: %w", err)
 	}
-	fmt.Fprintln(bench.progress, "Flash complete.")
+	fmt.Fprintln(bench.progress, done)
 	return nil
 }
 
