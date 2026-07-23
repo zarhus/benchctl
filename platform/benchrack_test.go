@@ -82,6 +82,7 @@ func testBenchRack(t *testing.T, runner *fakeRunner, g *fakeGPIO) *benchRack {
 	b := newBenchRack(runner, Config{}).(*benchRack)
 	b.gpio = g
 	b.settle = 0
+	b.powerCycleWait = 0
 	b.pollInterval = time.Microsecond
 	b.pollTimeout = 100 * time.Millisecond
 	b.progress = io.Discard
@@ -181,6 +182,10 @@ func TestBenchRackPowerResetCycles(t *testing.T) {
 	}
 	if len(holds) != 2 || holds[0] != b.powerOffHold || holds[1] != b.powerOnHold {
 		t.Errorf("power-reset presses = %v, want [off-hold on-hold] = [%d %d]", holds, b.powerOffHold, b.powerOnHold)
+	}
+	// The reset ends with the platform powered back on.
+	if st, _ := b.PowerState(); st.Power != PowerOn {
+		t.Errorf("after reset power = %v, want on", st.Power)
 	}
 }
 

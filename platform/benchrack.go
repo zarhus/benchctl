@@ -125,6 +125,10 @@ type benchRack struct {
 	powerOnHold  int // power-button pulse, seconds, to power on
 	powerOffHold int // power-button hold, seconds, to force S5 off
 	resetHold    int // reset-button pulse, seconds
+	// powerCycleWait is the gap a reset leaves between releasing the force-off
+	// press and the power-on press, so the platform settles in S5 and reads the
+	// on-press as a distinct press rather than a continuation of the hold.
+	powerCycleWait time.Duration
 
 	progress io.Writer
 }
@@ -135,17 +139,18 @@ func newBenchRack(runner exec.Runner, cfg Config) Platform {
 		name = defaultBoard
 	}
 	bench := &benchRack{
-		runner:       runner,
-		gpio:         rte.New(runner.Host()),
-		spiDev:       "/dev/spidev1.0",
-		spiSpeed:     16000,
-		settle:       2 * time.Second,
-		pollInterval: time.Second,
-		pollTimeout:  60 * time.Second,
-		powerOnHold:  1,
-		powerOffHold: 6,
-		resetHold:    1,
-		progress:     os.Stderr,
+		runner:         runner,
+		gpio:           rte.New(runner.Host()),
+		spiDev:         "/dev/spidev1.0",
+		spiSpeed:       16000,
+		settle:         2 * time.Second,
+		pollInterval:   time.Second,
+		pollTimeout:    60 * time.Second,
+		powerOnHold:    1,
+		powerOffHold:   6,
+		resetHold:      1,
+		powerCycleWait: 3 * time.Second,
+		progress:       os.Stderr,
 	}
 	brd, ok := boards[name]
 	if !ok {
@@ -229,6 +234,11 @@ func (bench *benchRack) PowerReset() error {
 	if err := bench.SetPower(PowerOff); err != nil {
 		return err
 	}
+	// The force-off holds the power button down until the RTE releases it. Wait
+	// for the button to release and the platform to settle in S5 before pressing
+	// again, so the on-press is a distinct press the platform acts on rather than
+	// a continuation of the hold, which would keep it off.
+	time.Sleep(bench.powerCycleWait)
 	return bench.SetPower(PowerOn)
 }
 
