@@ -321,6 +321,29 @@ func TestBenchRackFlashMuxEnableInterlock(t *testing.T) {
 	}
 }
 
+func TestBenchRackFlashMuxSelectDefaultsToHost(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	fw := writeSized(t, int(b.board.bmc.sizeBytes))
+	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
+		t.Fatal(err)
+	}
+	// The flash routes the mux to the BMC, but the bus must return to the host
+	// branch afterward: resting the select on the BMC freezes it even with the
+	// mux disabled.
+	lastMuxSelect := ""
+	for _, s := range g.sets {
+		if s.id == gpioMuxSelect {
+			lastMuxSelect = s.state
+		}
+	}
+	if lastMuxSelect != b.board.host.muxSelect {
+		t.Errorf("mux select final state = %q, want %q (host is the idle default)", lastMuxSelect, b.board.host.muxSelect)
+	}
+}
+
 func TestBenchRackFlashBMCOmitsChip(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{
 		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},

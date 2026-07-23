@@ -387,6 +387,12 @@ func (bench *benchRack) parkOff() error {
 			}
 		}
 	}
+	// Point the mux select at the host branch, the idle default. Resting the
+	// select on the BMC branch freezes the BMC even with the mux disabled, so the
+	// select must never sit there while idle.
+	if err := bench.gpio.Set(gpioMuxSelect, bench.board.host.muxSelect, 0); err != nil {
+		return err
+	}
 	// Drive the mux enable high (active-low, so disabled) to isolate both flashes
 	// while idle, which is the default state whenever a flash is not in progress.
 	return bench.gpio.Set(gpioMuxEnable, "high", 0)
@@ -403,6 +409,9 @@ func (bench *benchRack) deenergize() {
 	_ = bench.gpio.Set(gpioEnHost, "low", 0)
 	_ = bench.gpio.Set(gpioSpiVcc, "high-z", 0)
 	_ = bench.gpio.Set(gpioMuxEnable, "high", 0)
+	// Return the mux select to the host branch, the idle default, so a finished
+	// BMC flash never leaves the select resting on the BMC and freezing it.
+	_ = bench.gpio.Set(gpioMuxSelect, bench.board.host.muxSelect, 0)
 	_ = bench.gpio.Set(gpioSpiVoltage, "high-z", 0)
 }
 
