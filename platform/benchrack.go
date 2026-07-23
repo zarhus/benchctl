@@ -40,8 +40,8 @@ const (
 	gpioResetBtn   = 8  // DUT reset button
 	gpioPowerBtn   = 9  // DUT power button
 	gpioMuxEnable  = 13 // GPIO400, 2:1 mux enable (active-low): high isolates both flashes, low routes the selected branch
-	gpioEnBMC      = 14 // E_GPA1, BMC load-switch enable: high on, low off
-	gpioEnHost     = 15 // E_GPA2, host load-switch enable
+	gpioEnHost     = 14 // E_GPA1, host load-switch enable
+	gpioEnBMC      = 15 // E_GPA2, BMC load-switch enable: high on, low off
 	gpioMuxSelect  = 16 // 2:1 mux select
 	gpioPowerLED   = 17 // DUT power LED readback (led1, J1 pin 1 / GPIO12): high on, low off
 )
