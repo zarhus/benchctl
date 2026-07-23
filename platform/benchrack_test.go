@@ -237,9 +237,9 @@ func TestBenchRackFlashHostSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Energize order: voltage, mux select, mux enable, host load switch, Vcc,
+	// Energize order: voltage, mux select, mux enable, Vcc, host load switch,
 	// lines.
-	want := []int{gpioSpiVoltage, gpioMuxSelect, gpioMuxEnable, gpioEnHost, gpioSpiVcc, gpioSpiLines}
+	want := []int{gpioSpiVoltage, gpioMuxSelect, gpioMuxEnable, gpioSpiVcc, gpioEnHost, gpioSpiLines}
 	var got []int
 	// Reconstruct the energize prefix: take sets until SPI lines is first turned on.
 	for _, s := range g.sets {
@@ -495,6 +495,42 @@ func TestBenchRackFlashEnablesSwitchWhenConfigured(t *testing.T) {
 	}
 	if !enabled {
 		t.Error("powerSwitches on: host branch E_GPA was never enabled high")
+	}
+}
+
+func TestBenchRackFlashPowersRailBeforeSwitch(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	fw := writeSized(t, int(b.board.host.sizeBytes))
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// idx returns the position of the first set matching (id, state), or -1.
+	idx := func(id int, state string) int {
+		for i, s := range g.sets {
+			if s.id == id && s.state == state {
+				return i
+			}
+		}
+		return -1
+	}
+	vccOn := idx(gpioSpiVcc, "low")
+	switchOn := idx(gpioEnHost, "high")
+	switchOff := idx(gpioEnHost, "low")
+	vccOff := idx(gpioSpiVcc, "high-z")
+	if vccOn < 0 || switchOn < 0 || switchOff < 0 || vccOff < 0 {
+		t.Fatalf("missing a power set: vccOn=%d switchOn=%d switchOff=%d vccOff=%d", vccOn, switchOn, switchOff, vccOff)
+	}
+	// Power up: the RTE Vcc rail comes on before the load switch closes.
+	if vccOn > switchOn {
+		t.Errorf("Vcc on at %d, after the load switch at %d, want the rail up first", vccOn, switchOn)
+	}
+	// Power down: the load switch opens before the RTE Vcc rail drops.
+	if switchOff > vccOff {
+		t.Errorf("load switch off at %d, after Vcc at %d, want the switch open first", switchOff, vccOff)
 	}
 }
 

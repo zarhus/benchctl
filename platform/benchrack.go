@@ -297,13 +297,16 @@ func (bench *benchRack) withFlashBus(target FlashTarget, fn func(tgt targetCfg) 
 	if err := bench.gpio.Set(gpioMuxEnable, "low", 0); err != nil {
 		return err
 	}
+	// Bring up the SPI Vcc rail before closing the branch load switch, so the
+	// switch never ties a de-energized rail to a flash that another supply (the
+	// motherboard) may still hold at voltage and back-drive the rail.
+	if err := bench.gpio.Set(gpioSpiVcc, "low", 0); err != nil {
+		return err
+	}
 	if bench.board.powerSwitches {
 		if err := bench.gpio.Set(tgt.enable, "high", 0); err != nil {
 			return err
 		}
-	}
-	if err := bench.gpio.Set(gpioSpiVcc, "low", 0); err != nil {
-		return err
 	}
 	time.Sleep(bench.settle)
 	if err := bench.gpio.Set(gpioSpiLines, "low", 0); err != nil {
@@ -393,10 +396,13 @@ func (bench *benchRack) parkOff() error {
 // best-effort: the flash result is what the caller reports.
 func (bench *benchRack) deenergize() {
 	_ = bench.gpio.Set(gpioSpiLines, "high-z", 0)
-	_ = bench.gpio.Set(gpioSpiVcc, "high-z", 0)
-	_ = bench.gpio.Set(gpioMuxEnable, "high", 0)
+	// Open the load switches before dropping the SPI Vcc rail, isolating the
+	// flash from the rail before it de-energizes so no external supply can drive
+	// current back into it.
 	_ = bench.gpio.Set(gpioEnBMC, "low", 0)
 	_ = bench.gpio.Set(gpioEnHost, "low", 0)
+	_ = bench.gpio.Set(gpioSpiVcc, "high-z", 0)
+	_ = bench.gpio.Set(gpioMuxEnable, "high", 0)
 	_ = bench.gpio.Set(gpioSpiVoltage, "high-z", 0)
 }
 
