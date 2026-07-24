@@ -85,6 +85,7 @@ func testBenchRack(t *testing.T, runner *fakeRunner, g *fakeGPIO) *benchRack {
 	b.powerCycleWait = 0
 	b.pollInterval = time.Microsecond
 	b.pollTimeout = 100 * time.Millisecond
+	b.acCycleDelay = 0
 	b.progress = io.Discard
 	return b
 }
@@ -621,6 +622,117 @@ func TestBenchRackUnknownBoardErrors(t *testing.T) {
 	driver := newBenchRack(&fakeRunner{}, Config{Board: "no-such-board"})
 	if _, err := driver.PowerState(); err == nil || !strings.Contains(err.Error(), "no-such-board") {
 		t.Errorf("PowerState with unknown board = %v, want an error naming the board", err)
+	}
+}
+
+// curlCalls returns the joined argv of every recorded curl call, in order.
+func curlCalls(runner *fakeRunner) []string {
+	var out []string
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "curl" {
+			out = append(out, strings.Join(call, " "))
+		}
+	}
+	return out
+}
+
+func TestBenchRackACStateReadsTasmota(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		want Power
+	}{
+		{`{"POWER":"ON"}`, PowerOn},
+		{`{"POWER":"OFF"}`, PowerOff},
+	} {
+		runner := &fakeRunner{handler: func(int, []string) (string, error) { return tc.body, nil }}
+		b := testBenchRack(t, runner, &fakeGPIO{})
+		got, err := b.ACPowerState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Power != tc.want {
+			t.Errorf("ACPowerState from %s = %v, want %v", tc.body, got.Power, tc.want)
+		}
+		calls := curlCalls(runner)
+		if len(calls) != 1 || !strings.Contains(calls[0], defaultTasmotaIP) || !strings.Contains(calls[0], "cmnd=Power") {
+			t.Errorf("ACPowerState curl calls = %v, want one read of the default Tasmota", calls)
+		}
+	}
+}
+
+func TestBenchRackSetACPowerSwitchesAndConfirms(t *testing.T) {
+	runner := &fakeRunner{handler: func(_ int, argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "Power%20ON") {
+			return `{"POWER":"ON"}`, nil
+		}
+		return `{"POWER":"OFF"}`, nil
+	}}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.SetACPower(PowerOn); err != nil {
+		t.Fatal(err)
+	}
+	calls := curlCalls(runner)
+	if len(calls) != 1 || !strings.Contains(calls[0], "Power%20ON") {
+		t.Errorf("SetACPower(on) curl calls = %v, want one Power ON switch", calls)
+	}
+}
+
+func TestBenchRackSetACPowerErrorsOnMismatch(t *testing.T) {
+	// The plug reports the opposite of what was requested (e.g. relay stuck).
+	runner := &fakeRunner{handler: func(int, []string) (string, error) { return `{"POWER":"OFF"}`, nil }}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.SetACPower(PowerOn); err == nil {
+		t.Fatal("SetACPower should error when the Tasmota does not reach the requested state")
+	}
+}
+
+func TestBenchRackACPowerCycleOffThenOn(t *testing.T) {
+	var order []string
+	runner := &fakeRunner{handler: func(_ int, argv []string) (string, error) {
+		j := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(j, "Power%20OFF"):
+			order = append(order, "off")
+			return `{"POWER":"OFF"}`, nil
+		case strings.Contains(j, "Power%20ON"):
+			order = append(order, "on")
+			return `{"POWER":"ON"}`, nil
+		}
+		return `{"POWER":"OFF"}`, nil
+	}}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ACPowerCycle(); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "off" || order[1] != "on" {
+		t.Errorf("AC cycle order = %v, want [off on]", order)
+	}
+}
+
+func TestBenchRackACNotImplementedWithoutTasmota(t *testing.T) {
+	b := testBenchRack(t, &fakeRunner{}, &fakeGPIO{})
+	b.tasmota = nil
+	if _, err := b.ACPowerState(); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("ACPowerState = %v, want ErrNotImplemented", err)
+	}
+	if err := b.SetACPower(PowerOn); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("SetACPower = %v, want ErrNotImplemented", err)
+	}
+	if err := b.ACPowerCycle(); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("ACPowerCycle = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestBenchRackTasmotaIPOverride(t *testing.T) {
+	runner := &fakeRunner{handler: func(int, []string) (string, error) { return `{"POWER":"OFF"}`, nil }}
+	b := newBenchRack(runner, Config{TasmotaIP: "10.1.2.3"}).(*benchRack)
+	b.gpio = &fakeGPIO{}
+	if _, err := b.ACPowerState(); err != nil {
+		t.Fatal(err)
+	}
+	calls := curlCalls(runner)
+	if len(calls) != 1 || !strings.Contains(calls[0], "10.1.2.3") {
+		t.Errorf("override curl calls = %v, want the configured IP 10.1.2.3", calls)
 	}
 }
 

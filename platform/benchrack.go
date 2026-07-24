@@ -14,6 +14,7 @@ import (
 
 	"github.com/zarhus/benchctl/exec"
 	"github.com/zarhus/benchctl/internal/rte"
+	"github.com/zarhus/benchctl/internal/tasmota"
 )
 
 // BenchRack is the RTE-based bench. The driver controls GPIO, the SPI mux, and
@@ -74,9 +75,14 @@ type board struct {
 	bmc           targetCfg
 	powerSwitches bool // enable the selected branch's load switch during a flash
 	console       consoleCfg
+	tasmotaIP     string // AC-control Tasmota plug address; empty means the board has no AC control
 }
 
 const defaultBoard = "asrock-turin"
+
+// defaultTasmotaIP is where the plug sits on the RTE's isolated wifi AP: the
+// single-address DHCP pool always hands it this address.
+const defaultTasmotaIP = "192.168.66.50"
 
 // remoteFirmware is where FlashWrite stages the image on the RTE. It lives on
 // /data (persistent storage) rather than /var/tmp (tmpfs): the RTE has little
@@ -97,7 +103,8 @@ var boards = map[string]board{
 		powerSwitches: true,
 		// TODO(bring-up): confirm the mux-select polarity against the hardware.
 		// ser2net.yaml maps /dev/ttyS1 (115200n81) to telnet port 13541.
-		console: consoleCfg{port: 13541},
+		console:   consoleCfg{port: 13541},
+		tasmotaIP: defaultTasmotaIP,
 	},
 }
 
@@ -113,6 +120,7 @@ func boardNames() string {
 type benchRack struct {
 	runner   exec.Runner
 	gpio     gpioController
+	tasmota  *tasmota.Client // AC power control; nil when the board declares no Tasmota
 	board    board
 	boardErr error // set when the requested board is unknown
 
@@ -122,9 +130,10 @@ type benchRack struct {
 
 	pollInterval time.Duration
 	pollTimeout  time.Duration
-	powerOnHold  int // power-button pulse, seconds, to power on
-	powerOffHold int // power-button hold, seconds, to force S5 off
-	resetHold    int // reset-button pulse, seconds
+	powerOnHold  int           // power-button pulse, seconds, to power on
+	powerOffHold int           // power-button hold, seconds, to force S5 off
+	resetHold    int           // reset-button pulse, seconds
+	acCycleDelay time.Duration // off-to-on gap during an AC power-cycle
 	// powerCycleWait is the gap a reset leaves between releasing the force-off
 	// press and the power-on press, so the platform settles in S5 and reads the
 	// on-press as a distinct press rather than a continuation of the hold.
@@ -149,6 +158,7 @@ func newBenchRack(runner exec.Runner, cfg Config) Platform {
 		powerOnHold:    1,
 		powerOffHold:   6,
 		resetHold:      1,
+		acCycleDelay:   2 * time.Second,
 		powerCycleWait: 3 * time.Second,
 		progress:       os.Stderr,
 	}
@@ -158,6 +168,16 @@ func newBenchRack(runner exec.Runner, cfg Config) Platform {
 		return bench
 	}
 	bench.board = brd
+	// A Tasmota address from the config overrides the board default, and enables
+	// AC control on a board that declares none. When neither supplies one, the
+	// board has no AC control and the AC methods report ErrNotImplemented.
+	ip := cfg.TasmotaIP
+	if ip == "" {
+		ip = brd.tasmotaIP
+	}
+	if ip != "" {
+		bench.tasmota = tasmota.New(runner, ip)
+	}
 	return bench
 }
 
@@ -255,6 +275,75 @@ func (bench *benchRack) HardReset() error {
 	}
 	fmt.Fprintln(bench.progress, "Resetting host via reset button...")
 	return bench.gpio.Set(gpioResetBtn, "low", bench.resetHold)
+}
+
+// acClient returns the Tasmota client, or ErrNotImplemented when the board has
+// no AC control configured.
+func (bench *benchRack) acClient() (*tasmota.Client, error) {
+	if bench.boardErr != nil {
+		return nil, bench.boardErr
+	}
+	if bench.tasmota == nil {
+		return nil, ErrNotImplemented
+	}
+	return bench.tasmota, nil
+}
+
+// ACPowerState reports whether mains is applied to the PSU. It says nothing
+// about whether the host booted: reading the power LED (PowerState) remains the
+// real host-power signal.
+func (bench *benchRack) ACPowerState() (PowerStatus, error) {
+	client, err := bench.acClient()
+	if err != nil {
+		return PowerStatus{}, err
+	}
+	on, err := client.Power()
+	if err != nil {
+		return PowerStatus{}, err
+	}
+	return PowerStatus{Power: acPower(on)}, nil
+}
+
+// SetACPower switches the mains feed and confirms the Tasmota reached the
+// requested state. It does not press the power button or wait on the host: with
+// AC-recovery set to power on after loss, applying mains boots the DUT on its
+// own, otherwise the host stays in S5 and a separate power on is needed.
+func (bench *benchRack) SetACPower(target Power) error {
+	client, err := bench.acClient()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(bench.progress, "Switching AC %s...\n", target)
+	on, err := client.SetPower(target == PowerOn)
+	if err != nil {
+		return err
+	}
+	if got := acPower(on); got != target {
+		return fmt.Errorf("AC did not switch %s, Tasmota reports %s", target, got)
+	}
+	return nil
+}
+
+// ACPowerCycle drops mains and reapplies it after a short delay, forcing a cold
+// AC kill the front-panel button cannot.
+func (bench *benchRack) ACPowerCycle() error {
+	if _, err := bench.acClient(); err != nil {
+		return err
+	}
+	fmt.Fprintln(bench.progress, "Power-cycling AC...")
+	if err := bench.SetACPower(PowerOff); err != nil {
+		return err
+	}
+	time.Sleep(bench.acCycleDelay)
+	return bench.SetACPower(PowerOn)
+}
+
+// acPower maps the Tasmota on/off reading to a Power value.
+func acPower(on bool) Power {
+	if on {
+		return PowerOn
+	}
+	return PowerOff
 }
 
 func (bench *benchRack) Console() error {

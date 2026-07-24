@@ -14,11 +14,12 @@ import (
 
 // options holds the resolved global flags for a command invocation.
 type options struct {
-	host     string
-	platform string
-	password string
-	board    string
-	verbose  bool
+	host      string
+	platform  string
+	password  string
+	board     string
+	tasmotaIP string
+	verbose   bool
 }
 
 // resolveHost returns the bench host from the flag, then BENCHCTL_HOST, and
@@ -53,6 +54,15 @@ func resolveBoard(flagVal string) string {
 		return flagVal
 	}
 	return os.Getenv("BENCHCTL_BOARD")
+}
+
+// resolveTasmotaIP returns the AC-control Tasmota address from the flag, then
+// BENCHCTL_TASMOTA_IP, then empty so the driver uses its board default.
+func resolveTasmotaIP(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv("BENCHCTL_TASMOTA_IP")
 }
 
 // resolvePassword returns the SSH password from the flag, then
@@ -90,5 +100,9 @@ func build(opts options) (platform.Platform, error) {
 		return nil, err
 	}
 	runner := &exec.CmdRunner{Target: target, Verbose: opts.verbose}
-	return spec.New(runner, platform.Config{Board: resolveBoard(opts.board)}), nil
+	config := platform.Config{
+		Board:     resolveBoard(opts.board),
+		TasmotaIP: resolveTasmotaIP(opts.tasmotaIP),
+	}
+	return spec.New(runner, config), nil
 }

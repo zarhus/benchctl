@@ -82,6 +82,9 @@ type Platform interface {
 	SetPower(Power) error                          // polls until the requested state is reached
 	PowerReset() error                             // power-reset the host, polls until it is back on
 	HardReset() error                              // force a host reset through the platform's low-level path
+	ACPowerState() (PowerStatus, error)            // whether mains/AC is applied, where the platform has AC control
+	SetACPower(Power) error                        // switch the mains/AC feed and confirm the new state
+	ACPowerCycle() error                           // AC power-cycle: mains off, brief wait, mains on
 	Console() error                                // attach to the host serial console, detach on exit
 	FlashProbe(t FlashTarget) error                // detect and report the flash chip
 	FlashRead(t FlashTarget, outPath string) error // read the flash into outPath
@@ -93,7 +96,8 @@ type Platform interface {
 // Config carries resolved, driver-agnostic options into a driver constructor.
 // A driver uses only the fields that apply to it.
 type Config struct {
-	Board string // selected board; drivers that support several boards use it
+	Board     string // selected board; drivers that support several boards use it
+	TasmotaIP string // override for the AC-control Tasmota plug's address; empty uses the board default
 }
 
 // Spec describes a platform driver: its name, default SSH credentials, and a

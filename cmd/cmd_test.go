@@ -20,14 +20,26 @@ type fakePlatform struct {
 	flashErr  error
 	softReset bool
 	hardReset bool
+	acState   platform.PowerStatus
+	acErr     error
+	acSet     []platform.Power
+	acCycled  bool
 }
 
 func (fake *fakePlatform) PowerState() (platform.PowerStatus, error) { return fake.state, nil }
 func (fake *fakePlatform) SetPower(platform.Power) error             { return nil }
 func (fake *fakePlatform) PowerReset() error                         { fake.softReset = true; return nil }
 func (fake *fakePlatform) HardReset() error                          { fake.hardReset = true; return nil }
-func (fake *fakePlatform) Console() error                            { return nil }
-func (fake *fakePlatform) FlashProbe(platform.FlashTarget) error     { return fake.flashErr }
+func (fake *fakePlatform) ACPowerState() (platform.PowerStatus, error) {
+	return fake.acState, fake.acErr
+}
+func (fake *fakePlatform) SetACPower(p platform.Power) error {
+	fake.acSet = append(fake.acSet, p)
+	return fake.acErr
+}
+func (fake *fakePlatform) ACPowerCycle() error                   { fake.acCycled = true; return fake.acErr }
+func (fake *fakePlatform) Console() error                        { return nil }
+func (fake *fakePlatform) FlashProbe(platform.FlashTarget) error { return fake.flashErr }
 func (fake *fakePlatform) FlashRead(platform.FlashTarget, string) error {
 	return fake.flashErr
 }
@@ -110,10 +122,72 @@ func TestPowerResetRoutesSoftVersusHard(t *testing.T) {
 	}
 }
 
+func TestPowerACStatusPrintsState(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{acState: platform.PowerStatus{Power: platform.PowerOn}})
+	out, err := run(t, "power", "ac", "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "on") {
+		t.Errorf("power ac status output = %q, want the AC state", out)
+	}
+}
+
+func TestPowerACOnOffRoute(t *testing.T) {
+	on := &fakePlatform{}
+	withFakePlatform(t, on)
+	if _, err := run(t, "power", "ac", "on"); err != nil {
+		t.Fatal(err)
+	}
+	if len(on.acSet) != 1 || on.acSet[0] != platform.PowerOn {
+		t.Errorf("power ac on set = %v, want [on]", on.acSet)
+	}
+
+	off := &fakePlatform{}
+	withFakePlatform(t, off)
+	if _, err := run(t, "power", "ac", "off"); err != nil {
+		t.Fatal(err)
+	}
+	if len(off.acSet) != 1 || off.acSet[0] != platform.PowerOff {
+		t.Errorf("power ac off set = %v, want [off]", off.acSet)
+	}
+}
+
+func TestPowerACCycleRoutes(t *testing.T) {
+	f := &fakePlatform{}
+	withFakePlatform(t, f)
+	if _, err := run(t, "power", "ac", "cycle"); err != nil {
+		t.Fatal(err)
+	}
+	if !f.acCycled {
+		t.Error("power ac cycle did not call ACPowerCycle")
+	}
+}
+
+func TestPowerACPropagatesNotImplemented(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{acErr: platform.ErrNotImplemented})
+	_, err := run(t, "power", "ac", "on")
+	if !errors.Is(err, platform.ErrNotImplemented) {
+		t.Errorf("power ac on error = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestTasmotaIPFlagScopedToAC(t *testing.T) {
+	// The flag belongs to power ac, not the global set: accepted there, unknown
+	// on unrelated commands.
+	withFakePlatform(t, &fakePlatform{})
+	if _, err := run(t, "power", "ac", "status", "--tasmota-ip", "10.0.0.1"); err != nil {
+		t.Errorf("power ac status --tasmota-ip should be accepted, got %v", err)
+	}
+	if _, err := run(t, "power", "on", "--tasmota-ip", "10.0.0.1"); err == nil {
+		t.Error("power on --tasmota-ip should be rejected as an unknown flag")
+	}
+}
+
 func TestCommandTreeWired(t *testing.T) {
 	root := newRootCmd()
 	want := map[string][]string{
-		"power": {"on", "off", "status", "reset"},
+		"power": {"on", "off", "status", "reset", "ac"},
 		"flash": {"probe", "read", "write", "status", "abort"},
 	}
 	for parent, subs := range want {

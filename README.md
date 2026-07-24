@@ -38,6 +38,10 @@ bin/benchctl power off                                power off, wait until the 
 bin/benchctl power status                             print the current power state
 bin/benchctl power reset                              power-cycle off then on, wait until back on
 bin/benchctl power reset --hard                       hard-reset the host (mechanism varies by platform)
+bin/benchctl power ac on                              apply mains/AC power (Tasmota plug)
+bin/benchctl power ac off                             remove mains/AC power
+bin/benchctl power ac cycle                           AC power-cycle: mains off, brief wait, mains on
+bin/benchctl power ac status                          print whether mains/AC is applied
 bin/benchctl console                                  attach to the host serial console
 bin/benchctl flash probe <host|bmc>                   detect and print the flash chip
 bin/benchctl flash read  <host|bmc> <file>            read the flash into <file>
@@ -83,6 +87,32 @@ way: `flashrom` writes the image to a temporary path on the bench, then
 `benchctl` copies it back to your file and removes the temporary file. On the
 bench the file is already local and no copy happens.
 
+### AC power control
+
+`power ac` switches the DUT's mains feed through a Tasmota smart plug, giving a
+hard AC kill and cold boot that the front-panel power button cannot. It is a
+separate layer from the soft `power on`/`off`/`reset` commands, which pulse the
+power button and read the power LED.
+
+Two caveats follow from what the plug controls:
+
+- Mains on boots the host only when its firmware is set to power on after AC
+  loss (on ASRock, "Restore on AC/Power Loss = Power On"). Otherwise mains on
+  leaves the host in S5, and `power on` is still needed to start it. `power ac`
+  never presses the power button.
+- `power ac status` reports whether mains is applied, not whether the host
+  booted. `power status` (the power LED) remains the real host-power signal.
+
+On BenchRack the plug lives on the RTE's isolated wifi access point at
+`192.168.66.50`, reachable only from the RTE, so the command issues `curl` on
+the RTE. `curl` always runs on the RTE regardless of where you invoke benchctl:
+locally when you run it on the RTE, over SSH when you run it from a PC with
+`--host`. The RTE must have the wifi AP set up first.
+
+Point `--tasmota-ip` (or `BENCHCTL_TASMOTA_IP`) at another address when the plug
+is on a different network, such as the RTE's management LAN. Because `curl` runs
+on the RTE, a custom address must be reachable from the RTE, not from the PC.
+
 ## Platforms
 
 | Platform    | Status      | SSH user / default password |
@@ -90,9 +120,10 @@ bench the file is already local and no copy happens.
 | `benchrack` | implemented | `root` / `meta-rte`         |
 
 BenchRack flashes the host and BMC flashes through the SPI mux, controls host
-power through the RTE, and opens the serial console over SSH. `flash status` and
-`flash abort` report "not implemented", because `flashrom` runs to completion
-within one command and leaves no update state to query or abort.
+power through the RTE, switches the mains feed through a Tasmota plug, and opens
+the serial console over SSH. `flash status` and `flash abort` report "not
+implemented", because `flashrom` runs to completion within one command and
+leaves no update state to query or abort.
 
 Adding another platform is one package that implements the `Platform` interface
 and registers itself with `platform.Register()` from its `init()`. Drivers can
@@ -102,8 +133,8 @@ that imports this one and builds its own `main`.
 ## Dependencies
 
 - On the PC: `ssh`, `scp`, `sshpass`.
-- On a BenchRack RTE: `flashrom`, `telnet`, and the RteCtrl REST API (port
-  8000).
+- On a BenchRack RTE: `flashrom`, `telnet`, `curl` (for `power ac`), and the
+  RteCtrl REST API (port 8000).
 
 ## Development
 
