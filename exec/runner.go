@@ -91,6 +91,21 @@ func (runner *CmdRunner) Host() string {
 	return runner.Target.Host
 }
 
+// unreachable classifies a failed ssh invocation: it returns an UnreachableError
+// when ssh could not reach the bench, and nil when the failure belongs to the
+// command that ran there. detail is ssh's own output where the caller captured
+// it. Locally there is no ssh in the way, so every exit status is the command's
+// own.
+func (runner *CmdRunner) unreachable(err error, detail string) error {
+	if runner.Target.IsLocal() {
+		return nil
+	}
+	if code, ran := ExitCode(err); !ran || code != sshFailureStatus {
+		return nil
+	}
+	return &UnreachableError{Host: runner.Target.Host, Detail: detail, Status: err}
+}
+
 func (runner *CmdRunner) Run(argv ...string) (string, error) {
 	full := runner.commandArgv(argv, noTTY)
 	runner.trace(full)
@@ -99,7 +114,11 @@ func (runner *CmdRunner) Run(argv ...string) (string, error) {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("%s: %w: %s", shellJoin(argv), err, strings.TrimSpace(stderr.String()))
+		detail := strings.TrimSpace(stderr.String())
+		if unreachable := runner.unreachable(err, detail); unreachable != nil {
+			return "", unreachable
+		}
+		return "", fmt.Errorf("%s: %w: %s", shellJoin(argv), err, detail)
 	}
 	return string(out), nil
 }
@@ -119,7 +138,16 @@ func (runner *CmdRunner) runInteractive(argv []string, mode ttyMode) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	// ssh wrote its own diagnosis straight to the terminal, so there is nothing to
+	// carry in Detail.
+	if unreachable := runner.unreachable(err, ""); unreachable != nil {
+		return unreachable
+	}
+	return err
 }
 
 func (runner *CmdRunner) Stream(argv ...string) (io.ReadCloser, func() error, error) {
@@ -137,7 +165,11 @@ func (runner *CmdRunner) Stream(argv ...string) (io.ReadCloser, func() error, er
 	}
 	wait := func() error {
 		if err := cmd.Wait(); err != nil {
-			return fmt.Errorf("%s: %w: %s", shellJoin(argv), err, strings.TrimSpace(stderr.String()))
+			detail := strings.TrimSpace(stderr.String())
+			if unreachable := runner.unreachable(err, detail); unreachable != nil {
+				return unreachable
+			}
+			return fmt.Errorf("%s: %w: %s", shellJoin(argv), err, detail)
 		}
 		return nil
 	}

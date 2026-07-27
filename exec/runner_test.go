@@ -6,7 +6,9 @@ package exec
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	osexec "os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -91,6 +93,60 @@ func TestHostReturnsTargetHost(t *testing.T) {
 	runner := &CmdRunner{Target: Target{Host: "bench.local"}}
 	if got := runner.Host(); got != "bench.local" {
 		t.Errorf("Host() = %q, want bench.local", got)
+	}
+}
+
+// exitStatus returns the error a real process gives on exiting with status, so
+// that the classification runs against the same *exec.ExitError it sees in
+// production.
+func exitStatus(t *testing.T, status int) error {
+	t.Helper()
+	err := osexec.Command("sh", "-c", fmt.Sprintf("exit %d", status)).Run()
+	if err == nil {
+		t.Fatalf("sh -c 'exit %d' succeeded", status)
+	}
+	return err
+}
+
+func TestUnreachableReportsAnSSHFailure(t *testing.T) {
+	// ssh exits 255 when it cannot reach the host, before the bench command runs.
+	runner := &CmdRunner{Target: Target{Host: "192.168.50.10", User: "root"}}
+	err := runner.unreachable(exitStatus(t, 255), "ssh: connect to host 192.168.50.10 port 22: No route to host")
+	var target *UnreachableError
+	if !errors.As(err, &target) {
+		t.Fatalf("unreachable(255) = %v, want an UnreachableError", err)
+	}
+	if target.Host != "192.168.50.10" {
+		t.Errorf("Host = %q, want the bench host", target.Host)
+	}
+	if !strings.Contains(target.Error(), "No route to host") {
+		t.Errorf("error %q should carry what ssh reported", target)
+	}
+}
+
+func TestUnreachablePassesOverACommandFailure(t *testing.T) {
+	// ssh passes the remote command's own status through, which is the command's
+	// failure and not the bench's.
+	runner := &CmdRunner{Target: Target{Host: "192.168.50.10", User: "root"}}
+	if err := runner.unreachable(exitStatus(t, 1), "ipmitool: no response"); err != nil {
+		t.Errorf("unreachable(1) = %v, want nil", err)
+	}
+}
+
+func TestUnreachableIgnoresALocalTarget(t *testing.T) {
+	// Run on the bench there is no ssh in the way, so 255 is the command's own.
+	runner := &CmdRunner{Target: Target{Host: "localhost"}}
+	if err := runner.unreachable(exitStatus(t, 255), ""); err != nil {
+		t.Errorf("unreachable(255) on a local target = %v, want nil", err)
+	}
+}
+
+func TestUnreachableErrorNamesTheBenchWithoutDetail(t *testing.T) {
+	// An interactive command's ssh output goes to the terminal, so the message has
+	// to stand on the host name alone.
+	err := &UnreachableError{Host: "192.168.50.10", Status: exitStatus(t, 255)}
+	if !strings.Contains(err.Error(), "192.168.50.10") || !strings.Contains(err.Error(), "ssh") {
+		t.Errorf("error = %q, want it to name the bench and blame ssh", err)
 	}
 }
 

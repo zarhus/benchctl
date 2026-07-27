@@ -5,6 +5,7 @@
 package platform
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
@@ -45,7 +46,13 @@ type ConsoleSession struct {
 func (session ConsoleSession) Run(runner exec.Runner, progress io.Writer) error {
 	if len(session.Release) > 0 {
 		fmt.Fprintf(progress, "Releasing any open %s...\n", session.What)
-		_, _ = runner.Run(session.Release...)
+		// The release is also the first command to reach the bench, so a bench that
+		// cannot be reached shows up here. Stop: the attach would fail the same way,
+		// with ssh writing its own diagnosis to the terminal under a line that says
+		// the console is being attached.
+		if _, err := runner.Run(session.Release...); unreachable(err) {
+			return err
+		}
 		defer func() { _, _ = runner.Run(session.Release...) }()
 	}
 	fmt.Fprintf(progress, "Attaching to %s. Detach with %s.\n", session.What, session.Detach)
@@ -54,7 +61,19 @@ func (session ConsoleSession) Run(runner exec.Runner, progress io.Writer) error 
 		attach = runner.RunInteractiveNoEscape
 	}
 	if err := attach(session.Attach...); err != nil {
+		// An unreachable bench is not the console's failure, so naming the console
+		// would point at the wrong host.
+		if unreachable(err) {
+			return err
+		}
 		return fmt.Errorf("%s: %w", session.What, err)
 	}
 	return nil
+}
+
+// unreachable reports whether err says the bench itself could not be reached,
+// rather than that a command on it failed.
+func unreachable(err error) bool {
+	var target *exec.UnreachableError
+	return errors.As(err, &target)
 }

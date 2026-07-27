@@ -15,6 +15,7 @@ package tasmota
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -95,6 +96,12 @@ var curlReasons = map[int]string{
 // problem, not a curl problem, so it reads as one instead of as a shell error
 // with a URL in it.
 func (c *Client) requestError(err error) error {
+	// A bench that ssh could not reach already names itself, and curl never ran
+	// there, so adding the plug's address to that would point at the wrong host.
+	var unreachable *exec.UnreachableError
+	if errors.As(err, &unreachable) {
+		return err
+	}
 	code, ran := exec.ExitCode(err)
 	reason, named := curlReasons[code]
 	if !ran || !named {

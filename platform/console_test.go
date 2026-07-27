@@ -8,6 +8,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/zarhus/benchctl/exec"
 )
 
 // testSession is a console with a release command, standing in for any of the
@@ -93,6 +95,44 @@ func TestConsoleSessionIgnoresAFailedRelease(t *testing.T) {
 	}
 	if len(runner.interactive) != 1 {
 		t.Error("Run skipped the attach after a failed release")
+	}
+}
+
+func TestConsoleSessionStopsWhenTheBenchIsUnreachable(t *testing.T) {
+	// The release is the first command to reach the bench. When it cannot, the
+	// attach would fail the same way, with ssh writing its own diagnosis to the
+	// terminal under a line announcing the console.
+	runner := &fakeRunner{handler: func(int, []string) (string, error) {
+		return "", &exec.UnreachableError{Host: "192.168.50.10", Detail: "ssh: connect to host 192.168.50.10 port 22: No route to host"}
+	}}
+	err := testSession().Run(runner, &strings.Builder{})
+	if err == nil {
+		t.Fatal("Run should report an unreachable bench")
+	}
+	if len(runner.interactive) != 0 {
+		t.Error("Run attached to the console with the bench unreachable")
+	}
+	if !strings.Contains(err.Error(), "192.168.50.10") {
+		t.Errorf("error %q should name the bench", err)
+	}
+}
+
+func TestConsoleSessionDoesNotBlameTheConsoleForAnUnreachableBench(t *testing.T) {
+	// A console with nothing to release reaches the bench for the first time in
+	// the attach, and the console name would point at the wrong host.
+	runner := &fakeRunner{interactiveErr: &exec.UnreachableError{Host: "192.168.50.10", Status: errors.New("exit status 255")}}
+	session := testSession()
+	session.Release = nil
+	err := session.Run(runner, &strings.Builder{})
+	if err == nil {
+		t.Fatal("Run should report an unreachable bench")
+	}
+	if strings.Contains(err.Error(), session.What) {
+		t.Errorf("error %q blames the console for an unreachable bench", err)
+	}
+	var target *exec.UnreachableError
+	if !errors.As(err, &target) {
+		t.Errorf("error %q should stay an UnreachableError", err)
 	}
 }
 

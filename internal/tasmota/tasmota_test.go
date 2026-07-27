@@ -11,6 +11,8 @@ import (
 	osexec "os/exec"
 	"strings"
 	"testing"
+
+	"github.com/zarhus/benchctl/exec"
 )
 
 // fakeRunner is a test Runner. It returns canned output for Run and records the
@@ -164,6 +166,20 @@ func TestUnreachablePlugReadsAsASetupProblem(t *testing.T) {
 		if !strings.Contains(msg, "--tasmota-ip") {
 			t.Errorf("curl exit %d error = %q, want the address override in the hint", code, msg)
 		}
+	}
+}
+
+func TestUnreachableBenchIsReportedAsItself(t *testing.T) {
+	// ssh never got as far as running curl, so the failure belongs to the bench.
+	// Naming the plug's address here would point at the wrong host.
+	bench := &exec.UnreachableError{Host: "rte.local", Detail: "ssh: connect to host rte.local port 22: No route to host", Status: exitErr(t, 255)}
+	runner := &fakeRunner{err: bench}
+	_, err := New(runner, "192.168.66.50").Power()
+	if !errors.Is(err, bench) {
+		t.Fatalf("Power error = %v, want the bench's own unreachable error", err)
+	}
+	if strings.Contains(err.Error(), "192.168.66.50") {
+		t.Errorf("error = %q, should not name the plug when the bench is what failed", err)
 	}
 }
 
