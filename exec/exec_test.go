@@ -6,6 +6,7 @@ package exec
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -91,7 +92,7 @@ func TestSSHArgv(t *testing.T) {
 	target := Target{Host: "bench.local", User: "root", Password: "root"}
 	remote := []string{"bench-tool", "--addr", "[::1]:12225", "power", "on"}
 
-	got := sshArgv(target, remote, false)
+	got := sshArgv(target, remote, noTTY)
 	want := []string{
 		"sshpass", "-p", "root", "ssh",
 		"-o", "StrictHostKeyChecking=no",
@@ -108,11 +109,35 @@ func TestSSHArgv(t *testing.T) {
 
 func TestSSHArgvTTY(t *testing.T) {
 	target := Target{Host: "bench.local", User: "root", Password: "root"}
-	got := sshArgv(target, []string{"bench-tool", "console"}, true)
+	got := sshArgv(target, []string{"bench-tool", "console"}, remoteTTY)
 
 	// -tt must appear immediately after ssh to force a remote PTY.
 	if len(got) < 5 || got[3] != "ssh" || got[4] != "-tt" {
-		t.Errorf("sshArgv(tty=true) did not place -tt after ssh: %q", got)
+		t.Errorf("sshArgv(remoteTTY) did not place -tt after ssh: %q", got)
+	}
+	// The default console escapes with CTRL+], so ssh keeps its own "~" escape.
+	if slices.Contains(got, "-e") {
+		t.Errorf("sshArgv(remoteTTY) disabled the ssh escape character: %q", got)
+	}
+}
+
+func TestSSHArgvNoEscapeDisablesTilde(t *testing.T) {
+	// An IPMI serial-over-LAN session ends on "~.", which ssh would otherwise take
+	// as its own disconnect, leaving the SOL payload open on the BMC.
+	target := Target{Host: "bench.local", User: "root", Password: "root"}
+	got := sshArgv(target, []string{"ipmitool", "sol", "activate"}, remoteTTYNoEscape)
+
+	if len(got) < 7 || got[3] != "ssh" || got[4] != "-tt" || got[5] != "-e" || got[6] != "none" {
+		t.Errorf("sshArgv(remoteTTYNoEscape) = %q, want -tt -e none after ssh", got)
+	}
+}
+
+func TestSSHArgvNoTTYHasNoEscapeOption(t *testing.T) {
+	target := Target{Host: "bench.local", User: "root", Password: "root"}
+	got := sshArgv(target, []string{"flashrom", "-w", "rom.bin"}, noTTY)
+
+	if slices.Contains(got, "-tt") || slices.Contains(got, "-e") {
+		t.Errorf("sshArgv(noTTY) = %q, want neither -tt nor -e", got)
 	}
 }
 

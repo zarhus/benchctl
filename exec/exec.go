@@ -83,13 +83,29 @@ func shellQuote(arg string) string {
 	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
+// ttyMode selects the terminal handling for a bench command run over SSH.
+type ttyMode int
+
+const (
+	// noTTY runs the command with no remote terminal.
+	noTTY ttyMode = iota
+	// remoteTTY allocates a remote pseudo-terminal, needed by a console that puts
+	// its stdout into raw mode, and leaves ssh's own "~" escape character in place.
+	remoteTTY
+	// remoteTTYNoEscape allocates a remote pseudo-terminal and disables ssh's
+	// escape character, so that "~" reaches the program on the bench.
+	remoteTTYNoEscape
+)
+
 // sshArgv builds the local argv that runs remote (a bench command) on the bench
-// over SSH. tty requests a remote pseudo-terminal (needed by the serial console,
-// which puts its stdout into raw mode).
-func sshArgv(target Target, remote []string, tty bool) []string {
+// over SSH, with terminal handling per mode.
+func sshArgv(target Target, remote []string, mode ttyMode) []string {
 	argv := []string{"sshpass", "-p", target.Password, "ssh"}
-	if tty {
+	if mode != noTTY {
 		argv = append(argv, "-tt")
+	}
+	if mode == remoteTTYNoEscape {
+		argv = append(argv, "-e", "none")
 	}
 	argv = append(argv, sshOpts...)
 	argv = append(argv, target.User+"@"+target.Host, shellJoin(remote))

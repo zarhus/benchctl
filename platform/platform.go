@@ -75,6 +75,14 @@ type Status struct {
 	ID    string
 }
 
+// BMC addresses a baseboard management controller over IPMI. The caller supplies
+// the address, so drivers hold no default for it.
+type BMC struct {
+	IP       string
+	User     string
+	Password string
+}
+
 // Platform is one bench's control surface. Drivers implement it over whatever
 // control mechanism the platform provides.
 type Platform interface {
@@ -86,6 +94,7 @@ type Platform interface {
 	SetACPower(Power) error                        // switch the mains/AC feed and confirm the new state
 	ACPowerCycle() error                           // AC power-cycle: mains off, brief wait, mains on
 	Console() error                                // attach to the host serial console, detach on exit
+	ConsoleSOL(BMC) error                          // attach to the host console over the BMC's IPMI serial-over-LAN payload
 	FlashProbe(t FlashTarget) error                // detect and report the flash chip
 	FlashRead(t FlashTarget, outPath string) error // read the flash into outPath
 	FlashWrite(t FlashTarget, fw string, force bool) error

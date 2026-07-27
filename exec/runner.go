@@ -35,6 +35,13 @@ type Runner interface {
 	// RunInteractive runs argv on the bench attached to the local terminal,
 	// allocating a remote PTY over SSH. Used for the serial console.
 	RunInteractive(argv ...string) error
+	// RunInteractiveNoEscape is RunInteractive with the SSH client's own escape
+	// character disabled, for a bench program that takes "~" as its own escape.
+	// An IPMI serial-over-LAN session ends on "~.", which ssh would otherwise
+	// consume as its disconnect sequence, dropping the connection and leaving the
+	// SOL payload open on the BMC. Running locally there is no ssh in the way and
+	// this is identical to RunInteractive.
+	RunInteractiveNoEscape(argv ...string) error
 	// Stream runs argv on the bench and returns a reader of its standard output
 	// plus a wait function. The caller reads stdout to EOF, then calls wait,
 	// which returns the command's exit error (including stderr) or nil. Used for
@@ -64,13 +71,14 @@ type CmdRunner struct {
 }
 
 // commandArgv wraps a bench command for execution: unchanged when local, or an
-// ssh invocation when remote. tty requests a remote PTY (ignored locally, where
-// the process already inherits the terminal).
-func (runner *CmdRunner) commandArgv(argv []string, tty bool) []string {
+// ssh invocation when remote. mode selects the remote terminal handling and is
+// ignored locally, where the process already inherits the terminal and no ssh
+// sits between it and the user.
+func (runner *CmdRunner) commandArgv(argv []string, mode ttyMode) []string {
 	if runner.Target.IsLocal() {
 		return argv
 	}
-	return sshArgv(runner.Target, argv, tty)
+	return sshArgv(runner.Target, argv, mode)
 }
 
 func (runner *CmdRunner) trace(argv []string) {
@@ -84,7 +92,7 @@ func (runner *CmdRunner) Host() string {
 }
 
 func (runner *CmdRunner) Run(argv ...string) (string, error) {
-	full := runner.commandArgv(argv, false)
+	full := runner.commandArgv(argv, noTTY)
 	runner.trace(full)
 	cmd := exec.Command(full[0], full[1:]...)
 	var stderr strings.Builder
@@ -97,7 +105,15 @@ func (runner *CmdRunner) Run(argv ...string) (string, error) {
 }
 
 func (runner *CmdRunner) RunInteractive(argv ...string) error {
-	full := runner.commandArgv(argv, true)
+	return runner.runInteractive(argv, remoteTTY)
+}
+
+func (runner *CmdRunner) RunInteractiveNoEscape(argv ...string) error {
+	return runner.runInteractive(argv, remoteTTYNoEscape)
+}
+
+func (runner *CmdRunner) runInteractive(argv []string, mode ttyMode) error {
+	full := runner.commandArgv(argv, mode)
 	runner.trace(full)
 	cmd := exec.Command(full[0], full[1:]...)
 	cmd.Stdin = os.Stdin
@@ -107,7 +123,7 @@ func (runner *CmdRunner) RunInteractive(argv ...string) error {
 }
 
 func (runner *CmdRunner) Stream(argv ...string) (io.ReadCloser, func() error, error) {
-	full := runner.commandArgv(argv, false)
+	full := runner.commandArgv(argv, noTTY)
 	runner.trace(full)
 	cmd := exec.Command(full[0], full[1:]...)
 	var stderr strings.Builder

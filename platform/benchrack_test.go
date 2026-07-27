@@ -255,6 +255,56 @@ func TestBenchRackConsoleTelnetsToSer2net(t *testing.T) {
 	}
 }
 
+func TestBenchRackConsoleSOLClearsThenActivates(t *testing.T) {
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	bmc := BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}
+
+	if err := b.ConsoleSOL(bmc); err != nil {
+		t.Fatal(err)
+	}
+	// A session that ended without "~." leaves the payload open, so the deactivate
+	// must precede the activate.
+	if len(runner.calls) != 1 {
+		t.Fatalf("ConsoleSOL plain calls = %d, want 1 (sol deactivate)", len(runner.calls))
+	}
+	if got := strings.Join(runner.calls[0], " "); !strings.Contains(got, "sol deactivate") {
+		t.Errorf("first call = %q, want sol deactivate", got)
+	}
+	if len(runner.interactive) != 1 {
+		t.Fatalf("ConsoleSOL interactive calls = %d, want 1 (sol activate)", len(runner.interactive))
+	}
+	got := strings.Join(runner.interactive[0], " ")
+	if !strings.Contains(got, "sol activate") || !strings.Contains(got, bmc.IP) {
+		t.Errorf("interactive call = %q, want sol activate against %s", got, bmc.IP)
+	}
+	if !runner.noEscape[0] {
+		t.Error("ConsoleSOL attached with the ssh escape character live, so \"~.\" would not reach ipmitool")
+	}
+}
+
+func TestBenchRackConsoleSOLRequiresAddress(t *testing.T) {
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ConsoleSOL(BMC{User: "admin", Password: "Administrator"}); err == nil {
+		t.Fatal("ConsoleSOL should error without a BMC address")
+	}
+	if len(runner.calls) != 0 || len(runner.interactive) != 0 {
+		t.Error("ConsoleSOL ran ipmitool without a BMC address")
+	}
+	if g := b.gpio.(*fakeGPIO); len(g.sets) != 0 {
+		t.Errorf("ConsoleSOL without a BMC address set %v, want no GPIO writes", g.sets)
+	}
+}
+
+func TestBenchRackConsoleSOLReportsActivateFailure(t *testing.T) {
+	runner := &fakeRunner{interactiveErr: errors.New("SOL payload already active")}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ConsoleSOL(BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}); err == nil {
+		t.Fatal("ConsoleSOL should report an activate failure")
+	}
+}
+
 func TestBenchRackFlashHostSequence(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{
 		gpioEnBMC:  {Direction: "out", State: 0},
@@ -882,6 +932,9 @@ var powerCommands = []benchCommand{
 	{"PowerReset", 1, func(b *benchRack) error { return b.PowerReset() }},
 	{"HardReset", 1, func(b *benchRack) error { return b.HardReset() }},
 	{"Console", 1, func(b *benchRack) error { return b.Console() }},
+	{"ConsoleSOL", 1, func(b *benchRack) error {
+		return b.ConsoleSOL(BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"})
+	}},
 	{"ACPowerState", 1, func(b *benchRack) error { _, err := b.ACPowerState(); return err }},
 	{"SetACPower", 1, func(b *benchRack) error { return b.SetACPower(PowerOn) }},
 	{"ACPowerCycle", 1, func(b *benchRack) error { return b.ACPowerCycle() }},

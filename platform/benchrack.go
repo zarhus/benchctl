@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/zarhus/benchctl/exec"
+	"github.com/zarhus/benchctl/internal/ipmi"
 	"github.com/zarhus/benchctl/internal/rte"
 	"github.com/zarhus/benchctl/internal/tasmota"
 )
@@ -384,6 +385,32 @@ func (bench *benchRack) Console() error {
 	port := strconv.Itoa(bench.board.console.port)
 	fmt.Fprintf(bench.progress, "Attaching to host console via ser2net on port %s. Detach with CTRL+] then \"quit\".\n", port)
 	return bench.runner.RunInteractive("telnet", "localhost", port)
+}
+
+// ConsoleSOL attaches to the host console over the BMC's IPMI serial-over-LAN
+// payload. It is the way to the host when the motherboard serial port that
+// Console reaches carries BMC output instead, which is how OpenBMC is often
+// configured.
+func (bench *benchRack) ConsoleSOL(bmc BMC) error {
+	if bench.boardErr != nil {
+		return bench.boardErr
+	}
+	// Reject a missing address before parking, so a call the driver cannot act on
+	// leaves the bench untouched.
+	if bmc.IP == "" {
+		return fmt.Errorf("no BMC address for the SOL console")
+	}
+	if err := bench.ensureIdle(); err != nil {
+		return err
+	}
+	client := ipmi.New(bench.runner, bmc.IP, bmc.User, bmc.Password)
+	// A session that ended without "~." leaves the payload open on the BMC, and
+	// the next activate then refuses to run, so close it first. On a bench this
+	// stale payload is the common case rather than the exception.
+	fmt.Fprintf(bench.progress, "Closing any open SOL session on %s...\n", bmc.IP)
+	client.SOLDeactivate()
+	fmt.Fprintf(bench.progress, "Attaching to host console over IPMI SOL at %s. Detach with \"~.\" at the start of a line.\n", bmc.IP)
+	return client.SOLActivate()
 }
 
 // withFlashBus parks the bus, powers the board off so the RTE drives the flash,

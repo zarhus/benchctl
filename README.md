@@ -43,6 +43,7 @@ bin/benchctl power ac off                             remove mains/AC power
 bin/benchctl power ac cycle                           AC power-cycle: mains off, brief wait, mains on
 bin/benchctl power ac status                          print whether mains/AC is applied
 bin/benchctl console                                  attach to the host serial console
+bin/benchctl console --sol <bmc-ip>                   attach to the host console via BMC SOL
 bin/benchctl flash probe <host|bmc>                   detect and print the flash chip
 bin/benchctl flash read  <host|bmc> <file>            read the flash into <file>
 bin/benchctl flash write <host|bmc> <fw> [--force]    write firmware to the flash
@@ -129,6 +130,35 @@ A request the plug does not answer gives up after ten seconds and reports which
 address failed, so a wrong address or a plug that is off the network is a short
 error rather than a long wait.
 
+### Consoles
+
+`benchctl console` attaches to the motherboard's COM1 port, which the RTE
+exports over telnet with ser2net. That port carries host output only while the
+BMC leaves it to the host. An OpenBMC configured to print its own logs there
+takes the port over, and the host console then has to come from the BMC instead.
+
+`benchctl console --sol <bmc-ip>` reaches it that way, over the BMC's IPMI
+serial-over-LAN payload:
+
+```sh
+bin/benchctl --host rte.local console --sol 192.168.50.11
+```
+
+The credentials default to `admin` and `Administrator`, overridden with
+`--bmc-user` and `--bmc-password`.
+
+Detach with `~.` at the start of a line. Every attach runs `sol deactivate`
+first, because a session that ended any other way, such as a closed terminal or
+a dropped connection, leaves the payload open on the BMC and the next
+`sol activate` then refuses to run. On a shared bench that also drops whoever
+else is attached.
+
+`ipmitool` runs on the RTE, as `flashrom` and the Tasmota `curl` do, so the BMC
+must be reachable from the RTE rather than from your PC. A SOL session over SSH
+disables ssh's own escape character, so that `~.` reaches ipmitool instead of
+dropping the SSH connection and stranding the payload. The cost is that `~.`
+cannot rescue the SSH session itself while SOL is attached.
+
 ## Platforms
 
 | Platform    | Status      | SSH user / default password |
@@ -136,10 +166,11 @@ error rather than a long wait.
 | `benchrack` | implemented | `root` / `meta-rte`         |
 
 BenchRack flashes the host and BMC flashes through the SPI mux, controls host
-power through the RTE, switches the mains feed through a Tasmota plug, and opens
-the serial console over SSH. `flash status` and `flash abort` report "not
-implemented", because `flashrom` runs to completion within one command and
-leaves no update state to query or abort.
+power through the RTE, switches the mains feed through a Tasmota plug, and
+reaches the host console either over the RTE's ser2net port or over the BMC's
+IPMI serial-over-LAN. `flash status` and `flash abort` report "not implemented",
+because `flashrom` runs to completion within one command and leaves no update
+state to query or abort.
 
 Adding another platform is one package that implements the `Platform` interface
 and registers itself with `platform.Register()` from its `init()`. Drivers can
@@ -149,8 +180,8 @@ that imports this one and builds its own `main`.
 ## Dependencies
 
 - On the PC: `ssh`, `scp`, `sshpass`.
-- On a BenchRack RTE: `flashrom`, `telnet`, `curl` (for `power ac`), and the
-  RteCtrl REST API (port 8000).
+- On a BenchRack RTE: `flashrom`, `telnet`, `curl` (for `power ac`), `ipmitool`
+  (for `console --sol`), and the RteCtrl REST API (port 8000).
 
 ## Development
 

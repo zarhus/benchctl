@@ -70,7 +70,7 @@ func TestCommandArgvLocalIsUnchanged(t *testing.T) {
 	runner := &CmdRunner{Target: Target{Host: "localhost"}}
 	argv := []string{"bench-tool", "--addr", "[::1]:12225", "power", "on"}
 
-	got := runner.commandArgv(argv, false)
+	got := runner.commandArgv(argv, noTTY)
 	if !reflect.DeepEqual(got, argv) {
 		t.Errorf("local commandArgv = %q, want unchanged %q", got, argv)
 	}
@@ -80,8 +80,8 @@ func TestCommandArgvRemoteWrapsInSSH(t *testing.T) {
 	runner := &CmdRunner{Target: Target{Host: "bench.local", User: "root", Password: "root"}}
 	argv := []string{"bench-tool", "console"}
 
-	got := runner.commandArgv(argv, true)
-	want := sshArgv(runner.Target, argv, true)
+	got := runner.commandArgv(argv, remoteTTY)
+	want := sshArgv(runner.Target, argv, remoteTTY)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("remote commandArgv = %q, want %q", got, want)
 	}
