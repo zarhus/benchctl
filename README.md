@@ -110,5 +110,7 @@ task test
 task lint
 ```
 
-`.pre-commit-config.yaml` runs gofmt, `go vet`, and `go test` alongside the
-shared 3mdeb hooks. Install it with `pre-commit install`.
+`.pre-commit-config.yaml` runs gofmt, `go vet`, `go test`, and `reuse lint`
+alongside the shared 3mdeb hooks. Install it with `pre-commit install`. The
+`reuse lint` gate wants an `SPDX-FileCopyrightText` and an
+`SPDX-License-Identifier` tag in every new file.

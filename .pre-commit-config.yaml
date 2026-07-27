@@ -58,6 +58,14 @@ repos:
           - mdformat-gfm
           - mdformat-frontmatter
 
+  # Check that every file carries copyright and license information. The reuse
+  # hook lints the whole project rather than the staged files, so it catches a
+  # header missing from a file this commit does not touch.
+  - repo: https://github.com/fsfe/reuse-tool
+    rev: v6.2.0
+    hooks:
+      - id: reuse
+
   # Go tooling runs as local hooks against the system toolchain, matching the
   # Taskfile gates. gofmt and go vet need no network; go test runs the suite.
   - repo: local
