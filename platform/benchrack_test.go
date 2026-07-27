@@ -265,18 +265,14 @@ func TestBenchRackConsoleSOLClearsThenActivates(t *testing.T) {
 	}
 	// A session that ended without "~." leaves the payload open, so the deactivate
 	// must precede the activate.
-	if len(runner.calls) != 1 {
-		t.Fatalf("ConsoleSOL plain calls = %d, want 1 (sol deactivate)", len(runner.calls))
+	if len(runner.sequence) != 3 {
+		t.Fatalf("ConsoleSOL calls = %d, want 3 (deactivate, activate, deactivate)", len(runner.sequence))
 	}
-	if got := strings.Join(runner.calls[0], " "); !strings.Contains(got, "sol deactivate") {
-		t.Errorf("first call = %q, want sol deactivate", got)
-	}
-	if len(runner.interactive) != 1 {
-		t.Fatalf("ConsoleSOL interactive calls = %d, want 1 (sol activate)", len(runner.interactive))
-	}
-	got := strings.Join(runner.interactive[0], " ")
-	if !strings.Contains(got, "sol activate") || !strings.Contains(got, bmc.IP) {
-		t.Errorf("interactive call = %q, want sol activate against %s", got, bmc.IP)
+	for i, want := range []string{"sol deactivate", "sol activate", "sol deactivate"} {
+		got := strings.Join(runner.sequence[i], " ")
+		if !strings.Contains(got, want) || !strings.Contains(got, bmc.IP) {
+			t.Errorf("call %d = %q, want %s against %s", i, got, want, bmc.IP)
+		}
 	}
 	if !runner.noEscape[0] {
 		t.Error("ConsoleSOL attached with the ssh escape character live, so \"~.\" would not reach ipmitool")

@@ -383,8 +383,11 @@ func (bench *benchRack) Console() error {
 		return err
 	}
 	port := strconv.Itoa(bench.board.console.port)
-	fmt.Fprintf(bench.progress, "Attaching to host console via ser2net on port %s. Detach with CTRL+] then \"quit\".\n", port)
-	return bench.runner.RunInteractive("telnet", "localhost", port)
+	return ConsoleSession{
+		What:   "host console via telnet on port " + port,
+		Detach: `CTRL+] then "quit"`,
+		Attach: []string{"telnet", "localhost", port},
+	}.Run(bench.runner, bench.progress)
 }
 
 // ConsoleSOL attaches to the host console over the BMC's IPMI serial-over-LAN
@@ -403,14 +406,18 @@ func (bench *benchRack) ConsoleSOL(bmc BMC) error {
 	if err := bench.ensureIdle(); err != nil {
 		return err
 	}
-	client := ipmi.New(bench.runner, bmc.IP, bmc.User, bmc.Password)
-	// A session that ended without "~." leaves the payload open on the BMC, and
-	// the next activate then refuses to run, so close it first. On a bench this
-	// stale payload is the common case rather than the exception.
-	fmt.Fprintf(bench.progress, "Closing any open SOL session on %s...\n", bmc.IP)
-	client.SOLDeactivate()
-	fmt.Fprintf(bench.progress, "Attaching to host console over IPMI SOL at %s. Detach with \"~.\" at the start of a line.\n", bmc.IP)
-	return client.SOLActivate()
+	client := ipmi.New(bmc.IP, bmc.User, bmc.Password)
+	return ConsoleSession{
+		What:   "host console over IPMI SOL at " + bmc.IP,
+		Detach: `"~." at the start of a line`,
+		Attach: client.SOLActivate(),
+		// A session that ended without "~." leaves the payload open on the BMC and
+		// the next activate then refuses to run. On a bench that stale payload is
+		// the common case rather than the exception.
+		Release: client.SOLDeactivate(),
+		// The session ends on "~.", which ssh would otherwise take for itself.
+		NoEscape: true,
+	}.Run(bench.runner, bench.progress)
 }
 
 // withFlashBus parks the bus, powers the board off so the RTE drives the flash,

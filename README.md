@@ -148,10 +148,10 @@ The credentials default to `admin` and `Administrator`, overridden with
 `--bmc-user` and `--bmc-password`.
 
 Detach with `~.` at the start of a line. Every attach runs `sol deactivate`
-first, because a session that ended any other way, such as a closed terminal or
-a dropped connection, leaves the payload open on the BMC and the next
-`sol activate` then refuses to run. On a shared bench that also drops whoever
-else is attached.
+first, and again on the way out, because a session that ended any other way,
+such as a closed terminal or a dropped connection, leaves the payload open on
+the BMC and the next `sol activate` then refuses to run. On a shared bench the
+opening `sol deactivate` also drops whoever else is attached.
 
 `ipmitool` runs on the RTE, as `flashrom` and the Tasmota `curl` do, so the BMC
 must be reachable from the RTE rather than from your PC. A SOL session over SSH

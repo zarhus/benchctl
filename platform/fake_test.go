@@ -15,7 +15,8 @@ type fakeRunner struct {
 	handler        func(call int, argv []string) (string, error)
 	calls          [][]string
 	interactive    [][]string
-	noEscape       []bool // per interactive call, whether the ssh escape was disabled
+	sequence       [][]string // every call in order, plain and interactive alike
+	noEscape       []bool     // per interactive call, whether the ssh escape was disabled
 	pushed         bool
 	pulled         bool
 	streamOut      string // canned stdout for Stream
@@ -29,6 +30,7 @@ func (fake *fakeRunner) Host() string { return fake.host }
 func (fake *fakeRunner) Run(argv ...string) (string, error) {
 	callIndex := len(fake.calls)
 	fake.calls = append(fake.calls, argv)
+	fake.sequence = append(fake.sequence, argv)
 	if fake.handler != nil {
 		return fake.handler(callIndex, argv)
 	}
@@ -37,18 +39,21 @@ func (fake *fakeRunner) Run(argv ...string) (string, error) {
 
 func (fake *fakeRunner) RunInteractive(argv ...string) error {
 	fake.interactive = append(fake.interactive, argv)
+	fake.sequence = append(fake.sequence, argv)
 	fake.noEscape = append(fake.noEscape, false)
 	return fake.interactiveErr
 }
 
 func (fake *fakeRunner) RunInteractiveNoEscape(argv ...string) error {
 	fake.interactive = append(fake.interactive, argv)
+	fake.sequence = append(fake.sequence, argv)
 	fake.noEscape = append(fake.noEscape, true)
 	return fake.interactiveErr
 }
 
 func (fake *fakeRunner) Stream(argv ...string) (io.ReadCloser, func() error, error) {
 	fake.calls = append(fake.calls, argv)
+	fake.sequence = append(fake.sequence, argv)
 	return io.NopCloser(strings.NewReader(fake.streamOut)), func() error { return fake.streamErr }, nil
 }
 
