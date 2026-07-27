@@ -39,6 +39,14 @@ type ConsoleSession struct {
 	// NoEscape disables the SSH client's own escape character for the attach,
 	// for a program that takes "~" as its own.
 	NoEscape bool
+	// Unreachable, when set, reads a failed Release and reports whether the
+	// console cannot be reached at all, in which case Run stops instead of
+	// attaching. The release reaches the same place the attach does, so its
+	// failure is the cheapest reachability answer available, and acting on it
+	// spares the operator a second wait for the same timeout with the terminal
+	// already handed over. It takes the release's output as well as its error,
+	// because a tool may report the failure on either stream.
+	Unreachable func(output string, err error) error
 }
 
 // Run announces the session, attaches the terminal to it, and returns once the
@@ -46,12 +54,19 @@ type ConsoleSession struct {
 func (session ConsoleSession) Run(runner exec.Runner, progress io.Writer) error {
 	if len(session.Release) > 0 {
 		fmt.Fprintf(progress, "Releasing any open %s...\n", session.What)
-		// The release is also the first command to reach the bench, so a bench that
-		// cannot be reached shows up here. Stop: the attach would fail the same way,
-		// with ssh writing its own diagnosis to the terminal under a line that says
-		// the console is being attached.
-		if _, err := runner.Run(session.Release...); unreachable(err) {
+		// The release is also the first command to reach the bench and the console,
+		// so both kinds of unreachable show up here. Stop at either: the attach
+		// would fail the same way, after the same wait, with the tool writing its
+		// own diagnosis to the terminal under a line saying the console is being
+		// attached.
+		out, err := runner.Run(session.Release...)
+		if benchUnreachable(err) {
 			return err
+		}
+		if session.Unreachable != nil {
+			if err := session.Unreachable(out, err); err != nil {
+				return err
+			}
 		}
 		defer func() { _, _ = runner.Run(session.Release...) }()
 	}
@@ -63,7 +78,7 @@ func (session ConsoleSession) Run(runner exec.Runner, progress io.Writer) error 
 	if err := attach(session.Attach...); err != nil {
 		// An unreachable bench is not the console's failure, so naming the console
 		// would point at the wrong host.
-		if unreachable(err) {
+		if benchUnreachable(err) {
 			return err
 		}
 		return fmt.Errorf("%s: %w", session.What, err)
@@ -71,9 +86,9 @@ func (session ConsoleSession) Run(runner exec.Runner, progress io.Writer) error 
 	return nil
 }
 
-// unreachable reports whether err says the bench itself could not be reached,
-// rather than that a command on it failed.
-func unreachable(err error) bool {
+// benchUnreachable reports whether err says the bench itself could not be
+// reached, rather than that a command on it failed.
+func benchUnreachable(err error) bool {
 	var target *exec.UnreachableError
 	return errors.As(err, &target)
 }

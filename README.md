@@ -153,6 +153,10 @@ such as a closed terminal or a dropped connection, leaves the payload open on
 the BMC and the next `sol activate` then refuses to run. On a shared bench the
 opening `sol deactivate` also drops whoever else is attached.
 
+That opening `sol deactivate` opens a session of its own, so a BMC that does not
+answer is reported there, in a few seconds, rather than by an attach that waits
+out ipmitool's full timeout a second time with the terminal already handed over.
+
 `ipmitool` runs on the RTE, as `flashrom` and the Tasmota `curl` do, so the BMC
 must be reachable from the RTE rather than from your PC. A SOL session over SSH
 disables ssh's own escape character, so that `~.` reaches ipmitool instead of

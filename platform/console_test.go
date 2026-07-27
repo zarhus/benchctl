@@ -117,6 +117,49 @@ func TestConsoleSessionStopsWhenTheBenchIsUnreachable(t *testing.T) {
 	}
 }
 
+func TestConsoleSessionStopsWhenTheConsoleCannotBeReached(t *testing.T) {
+	// The release reaches the console the same way the attach does, so a console
+	// that does not answer is known before the attach waits out the same timeout
+	// with the terminal already handed over.
+	runner := &fakeRunner{handler: func(int, []string) (string, error) {
+		return "", errors.New("exit status 1: no such sled")
+	}}
+	session := testSession()
+	session.Unreachable = func(output string, err error) error {
+		return errors.New("cannot reach sled 0")
+	}
+	err := session.Run(runner, &strings.Builder{})
+	if err == nil || !strings.Contains(err.Error(), "cannot reach sled 0") {
+		t.Fatalf("Run = %v, want the unreachable report", err)
+	}
+	if len(runner.interactive) != 0 {
+		t.Error("Run attached to a console it had been told was unreachable")
+	}
+}
+
+func TestConsoleSessionAttachesWhenTheReleaseFailureIsBenign(t *testing.T) {
+	// With nothing attached the release reports failure, and that failure says
+	// the console answered.
+	runner := &fakeRunner{handler: func(int, []string) (string, error) {
+		return "", errors.New("exit status 1: nothing attached")
+	}}
+	session := testSession()
+	consulted := false
+	session.Unreachable = func(output string, err error) error {
+		consulted = true
+		return nil
+	}
+	if err := session.Run(runner, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	if !consulted {
+		t.Error("Run did not consult Unreachable for a failed release")
+	}
+	if len(runner.interactive) != 1 {
+		t.Error("Run skipped the attach after a release failure it was told to ignore")
+	}
+}
+
 func TestConsoleSessionDoesNotBlameTheConsoleForAnUnreachableBench(t *testing.T) {
 	// A console with nothing to release reaches the bench for the first time in
 	// the attach, and the console name would point at the wrong host.

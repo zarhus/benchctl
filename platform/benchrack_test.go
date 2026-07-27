@@ -279,6 +279,25 @@ func TestBenchRackConsoleSOLClearsThenActivates(t *testing.T) {
 	}
 }
 
+func TestBenchRackConsoleSOLStopsWhenTheBMCDoesNotAnswer(t *testing.T) {
+	// The deactivate opens a session of its own, so a BMC that never answers is
+	// known there, and attaching would only wait out the same timeout again.
+	runner := &fakeRunner{handler: func(int, []string) (string, error) {
+		return "", errors.New("exit status 1: Error: Unable to establish IPMI v2 / RMCP+ session")
+	}}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	err := b.ConsoleSOL(BMC{IP: "192.168.10.192", User: "admin", Password: "Administrator"})
+	if err == nil {
+		t.Fatal("ConsoleSOL should report a BMC that did not answer")
+	}
+	if !strings.Contains(err.Error(), "192.168.10.192") {
+		t.Errorf("error %q should name the BMC", err)
+	}
+	if len(runner.interactive) != 0 {
+		t.Error("ConsoleSOL attached over a BMC session it could not open")
+	}
+}
+
 func TestBenchRackConsoleSOLRequiresAddress(t *testing.T) {
 	runner := &fakeRunner{}
 	b := testBenchRack(t, runner, &fakeGPIO{})

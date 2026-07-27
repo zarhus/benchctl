@@ -415,6 +415,9 @@ func (bench *benchRack) ConsoleSOL(bmc BMC) error {
 		// the next activate then refuses to run. On a bench that stale payload is
 		// the common case rather than the exception.
 		Release: client.SOLDeactivate(),
+		// The deactivate opens a session of its own, so a BMC that does not answer
+		// is known before the attach would wait out the same timeout again.
+		Unreachable: client.Unreachable,
 		// The session ends on "~.", which ssh would otherwise take for itself.
 		NoEscape: true,
 	}.Run(bench.runner, bench.progress)
