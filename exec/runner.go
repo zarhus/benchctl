@@ -5,6 +5,7 @@
 package exec
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,18 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// ExitCode reports the exit status of the command behind err, and whether err
+// came from a command that ran and exited non-zero at all. A bench command run
+// over SSH exits with the remote command's status, so the status a caller reads
+// here is the bench program's own, wherever it ran.
+func ExitCode(err error) (int, bool) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), true
+	}
+	return 0, false
+}
 
 // Runner runs commands on a bench and copies firmware to and from it. The driver
 // depends on this interface so it can be tested with a fake.

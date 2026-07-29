@@ -5,6 +5,7 @@
 package exec
 
 import (
+	"errors"
 	"io"
 	"reflect"
 	"strings"
@@ -44,6 +45,24 @@ func TestStreamWaitReportsExitError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "boom") {
 		t.Errorf("wait() error %q should include captured stderr", err)
+	}
+}
+
+func TestExitCodeReadsThroughTheRunnerWrapping(t *testing.T) {
+	runner := &CmdRunner{Target: Target{Host: "localhost"}}
+
+	_, err := runner.Run("sh", "-c", "exit 7")
+	if err == nil {
+		t.Fatal("Run of a failing command returned nil error")
+	}
+	code, ran := ExitCode(err)
+	if !ran || code != 7 {
+		t.Errorf("ExitCode = (%d, %v), want (7, true)", code, ran)
+	}
+
+	// An error that never came from a command has no exit status to report.
+	if code, ran := ExitCode(errors.New("no command here")); ran || code != 0 {
+		t.Errorf("ExitCode of a plain error = (%d, %v), want (0, false)", code, ran)
 	}
 }
 

@@ -125,6 +125,10 @@ Point `--tasmota-ip` (or `BENCHCTL_TASMOTA_IP`) at another address when the plug
 is on a different network, such as the RTE's management LAN. Because `curl` runs
 on the RTE, a custom address must be reachable from the RTE, not from the PC.
 
+A request the plug does not answer gives up after ten seconds and reports which
+address failed, so a wrong address or a plug that is off the network is a short
+error rather than a long wait.
+
 ## Platforms
 
 | Platform    | Status      | SSH user / default password |
