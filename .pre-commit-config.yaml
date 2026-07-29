@@ -58,26 +58,34 @@ repos:
           - mdformat-gfm
           - mdformat-frontmatter
 
-  # Go tooling runs as local hooks against the system toolchain, matching the
-  # Taskfile gates. gofmt and go vet need no network; go test runs the suite.
   - repo: local
     hooks:
+      - id: check-go-version-sync
+        name: check pre-commit go version matches go.mod
+        entry: python3 scripts/verify-go-version.py
+        language: python
+        additional_dependencies: [pyyaml]
+        files: ^(go\.mod|\.pre-commit-config\.yaml)$
+        pass_filenames: false
       - id: gofmt
         name: gofmt
         entry: gofmt -l -w
-        language: system
+        language: golang
+        language_version: 1.25.11
         types: [go]
       - id: go-vet
         name: go vet
         entry: go vet ./...
-        language: system
+        language: golang
+        language_version: 1.25.11
         types: [go]
         pass_filenames: false
         require_serial: true
       - id: go-test
         name: go test
         entry: go test ./...
-        language: system
+        language: golang
+        language_version: 1.25.11
         types: [go]
         pass_filenames: false
         require_serial: true
