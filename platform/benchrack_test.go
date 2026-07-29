@@ -357,7 +357,7 @@ func TestBenchRackFlashMuxSelectDefaultsToHost(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{
 		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
 	}}
-	b := testBenchRack(t, &fakeRunner{}, g)
+	b := testBenchRack(t, &fakeRunner{handler: tasmotaReplies()}, g)
 	fw := writeSized(t, int(b.board.bmc.sizeBytes))
 	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
 		t.Fatal(err)
@@ -380,7 +380,7 @@ func TestBenchRackFlashBMCOmitsChip(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{
 		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
 	}}
-	runner := &fakeRunner{}
+	runner := &fakeRunner{handler: tasmotaReplies()}
 	b := testBenchRack(t, runner, g)
 	fw := writeSized(t, int(b.board.bmc.sizeBytes))
 
@@ -391,6 +391,80 @@ func TestBenchRackFlashBMCOmitsChip(t *testing.T) {
 		if len(call) > 0 && call[0] == "flashrom" && strings.Contains(strings.Join(call, " "), "-c ") {
 			t.Errorf("BMC flashrom argv = %q, should not pass -c (auto-detect)", strings.Join(call, " "))
 		}
+	}
+}
+
+func TestBenchRackFlashBMCRemovesMainsFirst(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	// Record the AC switches and how far the GPIO sequence had got when mains was
+	// dropped, so the energize steps can be placed relative to it.
+	var switches []string
+	setsAtACOff := -1
+	reply := tasmotaReplies()
+	runner := &fakeRunner{}
+	runner.handler = func(call int, argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "Power%20OFF") {
+			switches = append(switches, "off")
+			setsAtACOff = len(g.sets)
+		} else {
+			switches = append(switches, "on")
+		}
+		return reply(call, argv)
+	}
+	b := testBenchRack(t, runner, g)
+	fw := writeSized(t, int(b.board.bmc.sizeBytes))
+
+	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mains goes off once and stays off: the BMC comes back only on `power ac on`.
+	if len(switches) != 1 || switches[0] != "off" {
+		t.Fatalf("BMC flash AC switches = %v, want a single off", switches)
+	}
+	// Nothing energizes the BMC branch before mains is gone.
+	for i, s := range g.sets[:setsAtACOff] {
+		energized := (s.id == gpioMuxEnable && s.state == "low") ||
+			(s.id == gpioSpiLines && s.state == "low") ||
+			(s.id == gpioSpiVcc && s.state == "low") ||
+			(s.id == gpioEnBMC && s.state == "high")
+		if energized {
+			t.Errorf("set %+v at %d energized the BMC branch before mains was removed", s, i)
+		}
+	}
+}
+
+func TestBenchRackFlashHostLeavesMainsAlone(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	runner := &fakeRunner{handler: tasmotaReplies()}
+	b := testBenchRack(t, runner, g)
+	fw := writeSized(t, int(b.board.host.sizeBytes))
+
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
+		t.Fatal(err)
+	}
+	if calls := curlCalls(runner); len(calls) != 0 {
+		t.Errorf("host flash curl calls = %v, want none (the host flash does not touch mains)", calls)
+	}
+}
+
+func TestBenchRackFlashBMCNeedsACControl(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	b.tasmota = nil
+
+	err := b.FlashProbe(FlashBMC)
+	if err == nil || !strings.Contains(err.Error(), "mains") {
+		t.Fatalf("BMC flash without AC control = %v, want an error about removing mains", err)
+	}
+	if len(g.sets) != 0 {
+		t.Errorf("refused BMC flash drove %v, want the bench left untouched", g.setIDs())
 	}
 }
 

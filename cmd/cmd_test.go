@@ -172,15 +172,44 @@ func TestPowerACPropagatesNotImplemented(t *testing.T) {
 	}
 }
 
-func TestTasmotaIPFlagScopedToAC(t *testing.T) {
-	// The flag belongs to power ac, not the global set: accepted there, unknown
-	// on unrelated commands.
+func TestTasmotaIPFlagScope(t *testing.T) {
+	// The flag belongs to the commands that reach the plug, power ac and the flash
+	// commands that drive the bus, rather than to the global set.
 	withFakePlatform(t, &fakePlatform{})
-	if _, err := run(t, "power", "ac", "status", "--tasmota-ip", "10.0.0.1"); err != nil {
-		t.Errorf("power ac status --tasmota-ip should be accepted, got %v", err)
+	for _, args := range [][]string{
+		{"power", "ac", "status"},
+		{"flash", "probe", "bmc"},
+		{"flash", "read", "bmc", "dump.bin"},
+		{"flash", "write", "bmc", "fw.bin"},
+	} {
+		if _, err := run(t, append(args, "--tasmota-ip", "10.0.0.1")...); err != nil {
+			t.Errorf("%v --tasmota-ip should be accepted, got %v", args, err)
+		}
 	}
 	if _, err := run(t, "power", "on", "--tasmota-ip", "10.0.0.1"); err == nil {
 		t.Error("power on --tasmota-ip should be rejected as an unknown flag")
+	}
+}
+
+func TestFlashPassesTasmotaIP(t *testing.T) {
+	var got options
+	old := buildPlatform
+	buildPlatform = func(opts options) (platform.Platform, error) { got = opts; return &fakePlatform{}, nil }
+	t.Cleanup(func() { buildPlatform = old })
+
+	if _, err := run(t, "flash", "write", "bmc", "fw.bin", "--tasmota-ip", "10.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if got.tasmotaIP != "10.0.0.1" {
+		t.Errorf("flash write tasmotaIP = %q, want 10.0.0.1", got.tasmotaIP)
+	}
+
+	// Without the flag the driver falls back to the board's plug.
+	if _, err := run(t, "flash", "write", "bmc", "fw.bin"); err != nil {
+		t.Fatal(err)
+	}
+	if got.tasmotaIP != "" {
+		t.Errorf("flash write tasmotaIP = %q, want empty so the board default applies", got.tasmotaIP)
 	}
 }
 

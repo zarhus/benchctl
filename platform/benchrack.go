@@ -61,6 +61,7 @@ type targetCfg struct {
 	sizeBytes int64  // expected firmware size
 	muxSelect string // mux-select level ("high"/"low") that routes to this flash
 	enable    int    // load-switch enable pin id for this flash
+	acOff     bool   // remove mains before flashing: this chip's owner runs on standby power
 }
 
 // consoleCfg is where the DUT serial console is reached. The RTE runs ser2net,
@@ -99,7 +100,7 @@ const remoteReadback = "/data/readback.bin"
 var boards = map[string]board{
 	"asrock-turin": {
 		host:          targetCfg{chip: "W25Q256JV_Q", voltage: "3.3V", sizeBytes: 32 * 1024 * 1024, muxSelect: "low", enable: gpioEnHost},
-		bmc:           targetCfg{chip: "", voltage: "3.3V", sizeBytes: 64 * 1024 * 1024, muxSelect: "high", enable: gpioEnBMC},
+		bmc:           targetCfg{chip: "", voltage: "3.3V", sizeBytes: 64 * 1024 * 1024, muxSelect: "high", enable: gpioEnBMC, acOff: true},
 		powerSwitches: true,
 		// TODO(bring-up): confirm the mux-select polarity against the hardware.
 		// ser2net.yaml maps /dev/ttyS1 (115200n81) to telnet port 13541.
@@ -383,6 +384,10 @@ func (bench *benchRack) Console() error {
 // withFlashBus parks the bus, powers the board off so the RTE drives the flash,
 // energizes the selected branch, and runs fn with that flash on the SPI bus. It
 // always de-energizes the bus afterward, even when fn fails.
+//
+// A target marked acOff also has mains removed, and mains stays off once the
+// flash finishes: the bus returns to idle but the DUT does not come back on its
+// own, so bring it back with `power ac on`.
 func (bench *benchRack) withFlashBus(target FlashTarget, fn func(tgt targetCfg) error) error {
 	if bench.boardErr != nil {
 		return bench.boardErr
@@ -391,12 +396,27 @@ func (bench *benchRack) withFlashBus(target FlashTarget, fn func(tgt targetCfg) 
 	if err != nil {
 		return err
 	}
+	// Removing mains is the only way to release a standby-powered chip, so a board
+	// without AC control cannot flash one. Report that before anything touches the
+	// bench.
+	if tgt.acOff && bench.tasmota == nil {
+		return fmt.Errorf("flashing the %s needs mains removed, but this board has no AC control", target)
+	}
 
 	// Park the load switches and the bus off before touching voltage or the mux,
 	// calling parkOff rather than ensureIdle so a flash never trusts the state an
 	// earlier one left behind.
 	if err := bench.parkOff(); err != nil {
 		return err
+	}
+
+	// The BMC keeps running on standby power and driving its flash for as long as
+	// mains is applied, so soft power off is not enough to hand the chip to the
+	// RTE. Drop mains first.
+	if tgt.acOff {
+		if err := bench.SetACPower(PowerOff); err != nil {
+			return err
+		}
 	}
 
 	// The board is off, so the RTE powers the flash.

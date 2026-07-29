@@ -87,6 +87,15 @@ way: `flashrom` writes the image to a temporary path on the bench, then
 `benchctl` copies it back to your file and removes the temporary file. On the
 bench the file is already local and no copy happens.
 
+### Flashing the BMC
+
+A BMC flash removes mains first, through the same Tasmota plug as
+`power ac off`. The BMC runs on standby power, so it keeps driving its flash for
+as long as mains is applied, and a soft power off does not hand the chip to the
+bench. Mains stays off when the flash finishes, so bring the DUT back with
+`power ac on`. `flash probe`, `flash read`, and `flash write` take the same
+`--tasmota-ip` override as `power ac`, and use the board's plug without it.
+
 ### AC power control
 
 `power ac` switches the DUT's mains feed through a Tasmota smart plug, giving a

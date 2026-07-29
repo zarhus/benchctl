@@ -120,6 +120,14 @@ func flashCmd() *cobra.Command {
 		},
 	}
 
+	// A BMC flash removes mains through the Tasmota plug, so the bus-driving
+	// commands take the same address override as `power ac`. It is registered as a
+	// local flag on flash and on each leaf rather than as a persistent flag, for
+	// the reason given in acCmd.
+	for _, c := range []*cobra.Command{flash, probe, read, write} {
+		c.Flags().StringVar(&flagTasmotaIP, "tasmota-ip", "", "Tasmota plug address (or BENCHCTL_TASMOTA_IP); overrides the board default")
+	}
+
 	flash.AddCommand(probe, read, write, status, abort)
 	return flash
 }
