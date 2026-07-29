@@ -112,6 +112,7 @@ func testBenchRack(t *testing.T, runner *fakeRunner, g *fakeGPIO) *benchRack {
 	b.pollInterval = time.Microsecond
 	b.pollTimeout = 100 * time.Millisecond
 	b.acCycleDelay = 0
+	b.acDrainWait = 0
 	b.progress = io.Discard
 	return b
 }
@@ -433,6 +434,25 @@ func TestBenchRackFlashBMCRemovesMainsFirst(t *testing.T) {
 		if energized {
 			t.Errorf("set %+v at %d energized the BMC branch before mains was removed", s, i)
 		}
+	}
+}
+
+func TestBenchRackFlashBMCWaitsAfterMainsOff(t *testing.T) {
+	// The board holds the bus for a moment after mains goes away, so the flash
+	// waits before it energizes the branch.
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	b := testBenchRack(t, &fakeRunner{handler: tasmotaReplies()}, g)
+	b.acDrainWait = 20 * time.Millisecond
+	fw := writeSized(t, int(b.board.bmc.sizeBytes))
+
+	start := time.Now()
+	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < b.acDrainWait {
+		t.Errorf("BMC flash took %s, want at least the %s drain wait", elapsed, b.acDrainWait)
 	}
 }
 

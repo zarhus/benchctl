@@ -90,11 +90,14 @@ bench the file is already local and no copy happens.
 ### Flashing the BMC
 
 A BMC flash removes mains first, through the same Tasmota plug as
-`power ac off`. The BMC runs on standby power, so it keeps driving its flash for
-as long as mains is applied, and a soft power off does not hand the chip to the
-bench. Mains stays off when the flash finishes, so bring the DUT back with
-`power ac on`. `flash probe`, `flash read`, and `flash write` take the same
-`--tasmota-ip` override as `power ac`, and use the board's plug without it.
+`power ac off`, then waits five seconds for the board to discharge before it
+energizes the bus. The BMC runs on standby power, so it keeps driving its flash
+for as long as mains is applied and holds the bus for a moment afterward, which
+no soft power off can change. Mains stays off when the flash finishes, so bring
+the DUT back with `power ac on`.
+
+`flash probe`, `flash read`, and `flash write` take the same `--tasmota-ip`
+override as `power ac`, and use the board's plug without it.
 
 ### AC power control
 

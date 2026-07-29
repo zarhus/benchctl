@@ -136,6 +136,10 @@ type benchRack struct {
 	powerOffHold int           // power-button hold, seconds, to force S5 off
 	resetHold    int           // reset-button pulse, seconds
 	acCycleDelay time.Duration // off-to-on gap during an AC power-cycle
+	// acDrainWait is the gap a flash leaves between removing mains and energizing
+	// the bus, so the standby rails discharge and the chip's owner stops driving
+	// the flash before the RTE takes it over.
+	acDrainWait time.Duration
 	// powerCycleWait is the gap a reset leaves between releasing the force-off
 	// press and the power-on press, so the platform settles in S5 and reads the
 	// on-press as a distinct press rather than a continuation of the hold.
@@ -161,6 +165,7 @@ func newBenchRack(runner exec.Runner, cfg Config) Platform {
 		powerOffHold:   6,
 		resetHold:      1,
 		acCycleDelay:   2 * time.Second,
+		acDrainWait:    5 * time.Second,
 		powerCycleWait: 3 * time.Second,
 		progress:       os.Stderr,
 	}
@@ -412,11 +417,15 @@ func (bench *benchRack) withFlashBus(target FlashTarget, fn func(tgt targetCfg) 
 
 	// The BMC keeps running on standby power and driving its flash for as long as
 	// mains is applied, so soft power off is not enough to hand the chip to the
-	// RTE. Drop mains first.
+	// RTE. Drop mains first, then wait for the rails to discharge: the BMC holds
+	// the bus for a moment after mains goes away, and energizing the branch while
+	// it still drives the chip fights it for the bus.
 	if tgt.acOff {
 		if err := bench.SetACPower(PowerOff); err != nil {
 			return err
 		}
+		fmt.Fprintf(bench.progress, "Waiting %s for the board to discharge...\n", bench.acDrainWait)
+		time.Sleep(bench.acDrainWait)
 	}
 
 	// The board is off, so the RTE powers the flash.
