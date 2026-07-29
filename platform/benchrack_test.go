@@ -67,6 +67,32 @@ func (f *fakeGPIO) setIDs() []int {
 	return ids
 }
 
+// parkedBus reports whether the recorded sets contain an idle park: the mux
+// select resting on hostSelect and the mux enable driven high (disabled).
+func (f *fakeGPIO) parkedBus(hostSelect string) bool {
+	var selected, disabled bool
+	for _, s := range f.sets {
+		if s.id == gpioMuxSelect && s.state == hostSelect {
+			selected = true
+		}
+		if s.id == gpioMuxEnable && s.state == "high" {
+			disabled = true
+		}
+	}
+	return selected && disabled
+}
+
+// countSets returns how many recorded sets target id.
+func (f *fakeGPIO) countSets(id int) int {
+	n := 0
+	for _, s := range f.sets {
+		if s.id == id {
+			n++
+		}
+	}
+	return n
+}
+
 // firstSet returns the first recorded set for id, or false if none.
 func (f *fakeGPIO) firstSet(id int) (gpioSet, bool) {
 	for _, s := range f.sets {
@@ -733,6 +759,89 @@ func TestBenchRackTasmotaIPOverride(t *testing.T) {
 	calls := curlCalls(runner)
 	if len(calls) != 1 || !strings.Contains(calls[0], "10.1.2.3") {
 		t.Errorf("override curl calls = %v, want the configured IP 10.1.2.3", calls)
+	}
+}
+
+// tasmotaReplies answers a Tasmota read or switch with the state the command
+// asked for, so an AC operation confirms and returns.
+func tasmotaReplies() func(int, []string) (string, error) {
+	return func(_ int, argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "Power%20OFF") {
+			return `{"POWER":"OFF"}`, nil
+		}
+		return `{"POWER":"ON"}`, nil
+	}
+}
+
+// benchCommand is one exported driver operation, with the power-LED state it
+// needs to run without erroring.
+type benchCommand struct {
+	name string
+	led  uint
+	run  func(*benchRack) error
+}
+
+// powerCommands are the operations that do not drive the flash bus themselves.
+var powerCommands = []benchCommand{
+	{"PowerState", 1, func(b *benchRack) error { _, err := b.PowerState(); return err }},
+	{"SetPower", 0, func(b *benchRack) error { return b.SetPower(PowerOn) }},
+	{"PowerReset", 1, func(b *benchRack) error { return b.PowerReset() }},
+	{"HardReset", 1, func(b *benchRack) error { return b.HardReset() }},
+	{"Console", 1, func(b *benchRack) error { return b.Console() }},
+	{"ACPowerState", 1, func(b *benchRack) error { _, err := b.ACPowerState(); return err }},
+	{"SetACPower", 1, func(b *benchRack) error { return b.SetACPower(PowerOn) }},
+	{"ACPowerCycle", 1, func(b *benchRack) error { return b.ACPowerCycle() }},
+}
+
+func TestBenchRackPowerCommandsParkFlashBus(t *testing.T) {
+	// A flash left energized by a killed run or an RTE reboot must not survive
+	// into the next command: every operation parks the bus and the load switches
+	// before it touches the bench.
+	for _, tc := range powerCommands {
+		g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: tc.led}}}
+		b := testBenchRack(t, &fakeRunner{handler: tasmotaReplies()}, g)
+		if err := tc.run(b); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if !g.parkedBus(b.board.host.muxSelect) {
+			t.Errorf("%s did not park the flash bus, sets = %v", tc.name, g.sets)
+		}
+	}
+}
+
+func TestBenchRackParksOncePerCommand(t *testing.T) {
+	// Parking writes to the mux, so it belongs once at the start of a command.
+	// A command that parks per power reading would rewrite the mux throughout
+	// the poll loop.
+	for _, tc := range powerCommands {
+		g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: tc.led}}}
+		b := testBenchRack(t, &fakeRunner{handler: tasmotaReplies()}, g)
+		if err := tc.run(b); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := g.countSets(gpioMuxEnable); got != 1 {
+			t.Errorf("%s parked %d times, want 1", tc.name, got)
+		}
+	}
+}
+
+func TestBenchRackACWithoutTasmotaLeavesGPIOUntouched(t *testing.T) {
+	// An unsupported operation reports ErrNotImplemented without parking, so it
+	// leaves the bench exactly as it found it.
+	for _, tc := range []benchCommand{
+		{"ACPowerState", 1, func(b *benchRack) error { _, err := b.ACPowerState(); return err }},
+		{"SetACPower", 1, func(b *benchRack) error { return b.SetACPower(PowerOn) }},
+		{"ACPowerCycle", 1, func(b *benchRack) error { return b.ACPowerCycle() }},
+	} {
+		g := &fakeGPIO{}
+		b := testBenchRack(t, &fakeRunner{}, g)
+		b.tasmota = nil
+		if err := tc.run(b); !errors.Is(err, ErrNotImplemented) {
+			t.Fatalf("%s = %v, want ErrNotImplemented", tc.name, err)
+		}
+		if len(g.sets) != 0 {
+			t.Errorf("%s on a board without AC control set %v, want no GPIO writes", tc.name, g.sets)
+		}
 	}
 }
 

@@ -123,6 +123,7 @@ type benchRack struct {
 	tasmota  *tasmota.Client // AC power control; nil when the board declares no Tasmota
 	board    board
 	boardErr error // set when the requested board is unknown
+	idled    bool  // parkOff has driven the bus to its off state, see ensureIdle
 
 	spiDev   string
 	spiSpeed int
@@ -192,9 +193,29 @@ func (bench *benchRack) target(t FlashTarget) (targetCfg, error) {
 	}
 }
 
-func (bench *benchRack) PowerState() (PowerStatus, error) {
+// ensureIdle brings the bench to its resting state before an operation touches
+// it, and does so once per driver instance. Parking writes to the mux, so
+// repeating it inside the power poll would rewrite the mux on every reading.
+// Because it is a no-op after the first call, an operation can park up front and
+// still delegate to another exported one.
+//
+// Every exported operation calls it first. deenergize runs only as a defer, so a
+// flash killed mid-run or interrupted by an RTE reboot leaves the SPI rail up and
+// a load switch closed. Parking here means a later command cannot energize the
+// board while the RTE still drives a flash.
+func (bench *benchRack) ensureIdle() error {
 	if bench.boardErr != nil {
-		return PowerStatus{}, bench.boardErr
+		return bench.boardErr
+	}
+	if bench.idled {
+		return nil
+	}
+	return bench.parkOff()
+}
+
+func (bench *benchRack) PowerState() (PowerStatus, error) {
+	if err := bench.ensureIdle(); err != nil {
+		return PowerStatus{}, err
 	}
 	pin, err := bench.gpio.Get(gpioPowerLED)
 	if err != nil {
@@ -208,8 +229,8 @@ func (bench *benchRack) PowerState() (PowerStatus, error) {
 }
 
 func (bench *benchRack) SetPower(target Power) error {
-	if bench.boardErr != nil {
-		return bench.boardErr
+	if err := bench.ensureIdle(); err != nil {
+		return err
 	}
 	cur, err := bench.PowerState()
 	if err != nil {
@@ -247,8 +268,8 @@ func (bench *benchRack) pollPower(target Power) error {
 }
 
 func (bench *benchRack) PowerReset() error {
-	if bench.boardErr != nil {
-		return bench.boardErr
+	if err := bench.ensureIdle(); err != nil {
+		return err
 	}
 	fmt.Fprintln(bench.progress, "Power-cycling host...")
 	if err := bench.SetPower(PowerOff); err != nil {
@@ -263,8 +284,8 @@ func (bench *benchRack) PowerReset() error {
 }
 
 func (bench *benchRack) HardReset() error {
-	if bench.boardErr != nil {
-		return bench.boardErr
+	if err := bench.ensureIdle(); err != nil {
+		return err
 	}
 	status, err := bench.PowerState()
 	if err != nil {
@@ -278,13 +299,17 @@ func (bench *benchRack) HardReset() error {
 }
 
 // acClient returns the Tasmota client, or ErrNotImplemented when the board has
-// no AC control configured.
+// no AC control configured. It reports an unsupported board before parking, so
+// an operation the platform cannot perform leaves the bench untouched.
 func (bench *benchRack) acClient() (*tasmota.Client, error) {
 	if bench.boardErr != nil {
 		return nil, bench.boardErr
 	}
 	if bench.tasmota == nil {
 		return nil, ErrNotImplemented
+	}
+	if err := bench.ensureIdle(); err != nil {
+		return nil, err
 	}
 	return bench.tasmota, nil
 }
@@ -347,8 +372,8 @@ func acPower(on bool) Power {
 }
 
 func (bench *benchRack) Console() error {
-	if bench.boardErr != nil {
-		return bench.boardErr
+	if err := bench.ensureIdle(); err != nil {
+		return err
 	}
 	port := strconv.Itoa(bench.board.console.port)
 	fmt.Fprintf(bench.progress, "Attaching to host console via ser2net on port %s. Detach with CTRL+] then \"quit\".\n", port)
@@ -367,8 +392,9 @@ func (bench *benchRack) withFlashBus(target FlashTarget, fn func(tgt targetCfg) 
 		return err
 	}
 
-	// Park the load switches and the bus off before touching voltage or the
-	// mux, and export the E_GPA pins as outputs if this is the first run.
+	// Park the load switches and the bus off before touching voltage or the mux,
+	// calling parkOff rather than ensureIdle so a flash never trusts the state an
+	// earlier one left behind.
 	if err := bench.parkOff(); err != nil {
 		return err
 	}
@@ -462,7 +488,8 @@ func (bench *benchRack) FlashWrite(target FlashTarget, fw string, force bool) er
 
 // parkOff drives the load-switch enables and the SPI bus to a known-off state.
 // It exports the E_GPA pins as outputs when they are still high-Z inputs from
-// boot, and turns off SPI Vcc or lines if a previous run left them on.
+// boot, and turns off SPI Vcc or lines if a previous run left them on. On success
+// it records the bench as idle, which is what lets ensureIdle skip a second park.
 func (bench *benchRack) parkOff() error {
 	for _, id := range []int{gpioEnBMC, gpioEnHost} {
 		pin, err := bench.gpio.Get(id)
@@ -494,7 +521,11 @@ func (bench *benchRack) parkOff() error {
 	}
 	// Drive the mux enable high (active-low, so disabled) to isolate both flashes
 	// while idle, which is the default state whenever a flash is not in progress.
-	return bench.gpio.Set(gpioMuxEnable, "high", 0)
+	if err := bench.gpio.Set(gpioMuxEnable, "high", 0); err != nil {
+		return err
+	}
+	bench.idled = true
+	return nil
 }
 
 // deenergize returns the bus and switches to idle. It runs in a defer, so it is
