@@ -141,10 +141,15 @@ type benchRack struct {
 	// the bus, so the standby rails discharge and the chip's owner stops driving
 	// the flash before the RTE takes it over.
 	acDrainWait time.Duration
-	// powerCycleWait is the gap a reset leaves between releasing the force-off
-	// press and the power-on press, so the platform settles in S5 and reads the
-	// on-press as a distinct press rather than a continuation of the hold.
-	powerCycleWait time.Duration
+	// powerSettle is the gap left after a button comes back up, so the platform
+	// has settled in the state the press asked for before anything presses again.
+	powerSettle time.Duration
+	// sleep waits out a delay, time.Sleep in a driver that drives a bench. It is
+	// a field because the button-release wait is derived from the hold the RTE
+	// was given rather than from a constant a test can zero, so a test points it
+	// at a clock it controls and asserts the button is up when a power operation
+	// returns.
+	sleep func(time.Duration)
 
 	progress io.Writer
 }
@@ -155,20 +160,21 @@ func newBenchRack(runner exec.Runner, cfg Config) Platform {
 		name = defaultBoard
 	}
 	bench := &benchRack{
-		runner:         runner,
-		gpio:           rte.New(runner.Host()),
-		spiDev:         "/dev/spidev1.0",
-		spiSpeed:       16000,
-		settle:         2 * time.Second,
-		pollInterval:   time.Second,
-		pollTimeout:    60 * time.Second,
-		powerOnHold:    1,
-		powerOffHold:   6,
-		resetHold:      1,
-		acCycleDelay:   2 * time.Second,
-		acDrainWait:    5 * time.Second,
-		powerCycleWait: 3 * time.Second,
-		progress:       os.Stderr,
+		runner:       runner,
+		gpio:         rte.New(runner.Host()),
+		spiDev:       "/dev/spidev1.0",
+		spiSpeed:     16000,
+		settle:       2 * time.Second,
+		pollInterval: time.Second,
+		pollTimeout:  60 * time.Second,
+		powerOnHold:  1,
+		powerOffHold: 6,
+		resetHold:    1,
+		acCycleDelay: 2 * time.Second,
+		acDrainWait:  5 * time.Second,
+		powerSettle:  3 * time.Second,
+		sleep:        time.Sleep,
+		progress:     os.Stderr,
 	}
 	brd, ok := boards[name]
 	if !ok {
@@ -254,7 +260,23 @@ func (bench *benchRack) SetPower(target Power) error {
 	if err := bench.gpio.Set(gpioPowerBtn, "low", hold); err != nil {
 		return err
 	}
+	bench.awaitRelease(hold)
 	return bench.pollPower(target)
+}
+
+// awaitRelease waits for a button the RTE is holding to come back up, and for
+// the platform to settle once it has.
+//
+// The RTE answers a press as soon as it accepts the request and releases the pin
+// holdSecs later, so the press outlives the call that made it. An ATX force-off
+// latches S5 partway through its hold, which means the power state can read the
+// transition while the button is still down: polling alone would report a
+// finished transition mid-press. Waiting here is what lets a power operation that
+// has returned mean the button is up, so the next press - from PowerReset below,
+// or from the next benchctl the caller runs - is an edge the platform acts on
+// rather than a continuation of a hold that leaves the host where it is.
+func (bench *benchRack) awaitRelease(holdSecs int) {
+	bench.sleep(time.Duration(holdSecs)*time.Second + bench.powerSettle)
 }
 
 func (bench *benchRack) pollPower(target Power) error {
@@ -282,11 +304,6 @@ func (bench *benchRack) PowerReset() error {
 	if err := bench.SetPower(PowerOff); err != nil {
 		return err
 	}
-	// The force-off holds the power button down until the RTE releases it. Wait
-	// for the button to release and the platform to settle in S5 before pressing
-	// again, so the on-press is a distinct press the platform acts on rather than
-	// a continuation of the hold, which would keep it off.
-	time.Sleep(bench.powerCycleWait)
 	return bench.SetPower(PowerOn)
 }
 
@@ -302,7 +319,11 @@ func (bench *benchRack) HardReset() error {
 		return fmt.Errorf("host is %s, use a hard reset only when the host is powered on and a normal reset does not work", status)
 	}
 	fmt.Fprintln(bench.progress, "Resetting host via reset button...")
-	return bench.gpio.Set(gpioResetBtn, "low", bench.resetHold)
+	if err := bench.gpio.Set(gpioResetBtn, "low", bench.resetHold); err != nil {
+		return err
+	}
+	bench.awaitRelease(bench.resetHold)
+	return nil
 }
 
 // acClient returns the Tasmota client, or ErrNotImplemented when the board has

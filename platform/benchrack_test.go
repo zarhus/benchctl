@@ -28,12 +28,28 @@ type gpioSet struct {
 // call. A power-button press (gpioPowerBtn) toggles the power LED
 // (gpioPowerLED), modelling how a press flips host power so SetPower's poll can
 // settle.
+//
+// It also models the RTE's auto-release, against a virtual clock the driver's
+// sleep advances: a press with a hold keeps its pin down until the clock passes
+// the hold, and a press that lands while the pin is still down is recorded as an
+// overlap. An overlap is the fault a released button rules out - the platform
+// sees one continuous assertion rather than a new press.
 type fakeGPIO struct {
 	pins   map[int]rte.Pin
 	sets   []gpioSet
 	getErr error
 	setErr error
+
+	clock     time.Duration         // virtual now, moved on by advance
+	heldUntil map[int]time.Duration // per pin, when the RTE lets it back up
+	overlaps  []int                 // pins pressed again while still held
 }
+
+// advance moves the virtual clock on, standing in for the driver's sleep.
+func (f *fakeGPIO) advance(d time.Duration) { f.clock += d }
+
+// held reports whether the RTE is still holding pin id down.
+func (f *fakeGPIO) held(id int) bool { return f.clock < f.heldUntil[id] }
 
 func (f *fakeGPIO) Get(id int) (rte.Pin, error) {
 	if f.getErr != nil {
@@ -46,6 +62,15 @@ func (f *fakeGPIO) Set(id int, state string, hold int) error {
 	f.sets = append(f.sets, gpioSet{id, state, hold})
 	if f.setErr != nil {
 		return f.setErr
+	}
+	if hold > 0 {
+		if f.held(id) {
+			f.overlaps = append(f.overlaps, id)
+		}
+		if f.heldUntil == nil {
+			f.heldUntil = map[int]time.Duration{}
+		}
+		f.heldUntil[id] = f.clock + time.Duration(hold)*time.Second
 	}
 	if id == gpioPowerBtn {
 		led := f.pins[gpioPowerLED]
@@ -108,7 +133,10 @@ func testBenchRack(t *testing.T, runner *fakeRunner, g *fakeGPIO) *benchRack {
 	b := newBenchRack(runner, Config{}).(*benchRack)
 	b.gpio = g
 	b.settle = 0
-	b.powerCycleWait = 0
+	b.powerSettle = 0
+	// Point the driver's waits at the fake's clock, so a button-release wait is
+	// observed in the fake rather than waited out in the test.
+	b.sleep = g.advance
 	b.pollInterval = time.Microsecond
 	b.pollTimeout = 100 * time.Millisecond
 	b.acCycleDelay = 0
@@ -182,6 +210,42 @@ func TestBenchRackSetPowerOffHoldsLong(t *testing.T) {
 	set, _ := g.firstSet(gpioPowerBtn)
 	if set.hold != b.powerOffHold {
 		t.Errorf("power-off hold = %d, want %d (force S5)", set.hold, b.powerOffHold)
+	}
+}
+
+func TestBenchRackSetPowerReturnsWithTheButtonReleased(t *testing.T) {
+	// A force-off latches S5 before its hold is up, so the power state settles
+	// mid-press. Returning there leaves the button down for the next command,
+	// whose press continues the hold instead of starting one.
+	g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: 1}}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	if err := b.SetPower(PowerOff); err != nil {
+		t.Fatal(err)
+	}
+	if g.held(gpioPowerBtn) {
+		t.Error("SetPower(off) returned while the RTE still held the power button")
+	}
+}
+
+func TestBenchRackPowerResetPressesOnAfterTheForceOffReleases(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: 1}}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	if err := b.PowerReset(); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.overlaps) != 0 {
+		t.Errorf("power-reset pressed a button that was still held: pins %v", g.overlaps)
+	}
+}
+
+func TestBenchRackHardResetReturnsWithTheButtonReleased(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: 1}}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	if err := b.HardReset(); err != nil {
+		t.Fatal(err)
+	}
+	if g.held(gpioResetBtn) {
+		t.Error("HardReset returned while the RTE still held the reset button")
 	}
 }
 
