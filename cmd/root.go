@@ -16,11 +16,12 @@ import (
 )
 
 var (
-	flagHost     string
-	flagPlatform string
-	flagPassword string
-	flagBoard    string
-	flagVerbose  bool
+	flagHost      string
+	flagPlatform  string
+	flagPassword  string
+	flagBoard     string
+	flagTasmotaIP string
+	flagVerbose   bool
 )
 
 // buildPlatform is the constructor commands use to obtain a Platform. It is a
@@ -56,11 +57,12 @@ func newRootCmd() *cobra.Command {
 
 func opts() options {
 	return options{
-		host:     flagHost,
-		platform: flagPlatform,
-		password: flagPassword,
-		board:    flagBoard,
-		verbose:  flagVerbose,
+		host:      flagHost,
+		platform:  flagPlatform,
+		password:  flagPassword,
+		board:     flagBoard,
+		tasmotaIP: flagTasmotaIP,
+		verbose:   flagVerbose,
 	}
 }
 

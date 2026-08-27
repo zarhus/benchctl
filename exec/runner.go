@@ -5,6 +5,7 @@
 package exec
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,8 +14,20 @@ import (
 	"strings"
 )
 
-// Runner runs commands on a bench and copies firmware to it. The driver depends
-// on this interface so it can be tested with a fake.
+// ExitCode reports the exit status of the command behind err, and whether err
+// came from a command that ran and exited non-zero at all. A bench command run
+// over SSH exits with the remote command's status, so the status a caller reads
+// here is the bench program's own, wherever it ran.
+func ExitCode(err error) (int, bool) {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), true
+	}
+	return 0, false
+}
+
+// Runner runs commands on a bench and copies firmware to and from it. The driver
+// depends on this interface so it can be tested with a fake.
 type Runner interface {
 	// Run executes argv on the bench and returns its standard output. The error,
 	// when non-nil, includes the command and its standard error.
@@ -22,6 +35,13 @@ type Runner interface {
 	// RunInteractive runs argv on the bench attached to the local terminal,
 	// allocating a remote PTY over SSH. Used for the serial console.
 	RunInteractive(argv ...string) error
+	// RunInteractiveNoEscape is RunInteractive with the SSH client's own escape
+	// character disabled, for a bench program that takes "~" as its own escape.
+	// An IPMI serial-over-LAN session ends on "~.", which ssh would otherwise
+	// consume as its disconnect sequence, dropping the connection and leaving the
+	// SOL payload open on the BMC. Running locally there is no ssh in the way and
+	// this is identical to RunInteractive.
+	RunInteractiveNoEscape(argv ...string) error
 	// Stream runs argv on the bench and returns a reader of its standard output
 	// plus a wait function. The caller reads stdout to EOF, then calls wait,
 	// which returns the command's exit error (including stderr) or nil. Used for
@@ -32,6 +52,11 @@ type Runner interface {
 	// it is a no-op that returns localPath (remotePath is ignored) and a cleanup
 	// that does nothing.
 	Push(localPath, remotePath string) (path string, cleanup func() error, err error)
+	// Pull arranges for a file the bench produces to reach localPath. It returns
+	// the path the bench command should write to (localPath when local, remotePath
+	// when remote) plus a fetch function that copies the file to localPath after
+	// the command runs (a no-op when local) and removes the remote temp.
+	Pull(localPath, remotePath string) (path string, fetch func() error, err error)
 	// Host reports the bench host the runner reaches, so a driver can address a
 	// second control surface on the same host (e.g. a REST API). It is
 	// "localhost" (or "") when commands run locally.
@@ -46,13 +71,14 @@ type CmdRunner struct {
 }
 
 // commandArgv wraps a bench command for execution: unchanged when local, or an
-// ssh invocation when remote. tty requests a remote PTY (ignored locally, where
-// the process already inherits the terminal).
-func (runner *CmdRunner) commandArgv(argv []string, tty bool) []string {
+// ssh invocation when remote. mode selects the remote terminal handling and is
+// ignored locally, where the process already inherits the terminal and no ssh
+// sits between it and the user.
+func (runner *CmdRunner) commandArgv(argv []string, mode ttyMode) []string {
 	if runner.Target.IsLocal() {
 		return argv
 	}
-	return sshArgv(runner.Target, argv, tty)
+	return sshArgv(runner.Target, argv, mode)
 }
 
 func (runner *CmdRunner) trace(argv []string) {
@@ -65,31 +91,67 @@ func (runner *CmdRunner) Host() string {
 	return runner.Target.Host
 }
 
+// unreachable classifies a failed ssh invocation: it returns an UnreachableError
+// when ssh could not reach the bench, and nil when the failure belongs to the
+// command that ran there. detail is ssh's own output where the caller captured
+// it. Locally there is no ssh in the way, so every exit status is the command's
+// own.
+func (runner *CmdRunner) unreachable(err error, detail string) error {
+	if runner.Target.IsLocal() {
+		return nil
+	}
+	if code, ran := ExitCode(err); !ran || code != sshFailureStatus {
+		return nil
+	}
+	return &UnreachableError{Host: runner.Target.Host, Detail: detail, Status: err}
+}
+
 func (runner *CmdRunner) Run(argv ...string) (string, error) {
-	full := runner.commandArgv(argv, false)
+	full := runner.commandArgv(argv, noTTY)
 	runner.trace(full)
 	cmd := exec.Command(full[0], full[1:]...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("%s: %w: %s", shellJoin(argv), err, strings.TrimSpace(stderr.String()))
+		detail := strings.TrimSpace(stderr.String())
+		if unreachable := runner.unreachable(err, detail); unreachable != nil {
+			return "", unreachable
+		}
+		return "", fmt.Errorf("%s: %w: %s", shellJoin(argv), err, detail)
 	}
 	return string(out), nil
 }
 
 func (runner *CmdRunner) RunInteractive(argv ...string) error {
-	full := runner.commandArgv(argv, true)
+	return runner.runInteractive(argv, remoteTTY)
+}
+
+func (runner *CmdRunner) RunInteractiveNoEscape(argv ...string) error {
+	return runner.runInteractive(argv, remoteTTYNoEscape)
+}
+
+func (runner *CmdRunner) runInteractive(argv []string, mode ttyMode) error {
+	full := runner.commandArgv(argv, mode)
 	runner.trace(full)
 	cmd := exec.Command(full[0], full[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	// ssh wrote its own diagnosis straight to the terminal, so there is nothing to
+	// carry in Detail.
+	if unreachable := runner.unreachable(err, ""); unreachable != nil {
+		return unreachable
+	}
+	return err
 }
 
 func (runner *CmdRunner) Stream(argv ...string) (io.ReadCloser, func() error, error) {
-	full := runner.commandArgv(argv, false)
+	full := runner.commandArgv(argv, noTTY)
 	runner.trace(full)
 	cmd := exec.Command(full[0], full[1:]...)
 	var stderr strings.Builder
@@ -103,7 +165,11 @@ func (runner *CmdRunner) Stream(argv ...string) (io.ReadCloser, func() error, er
 	}
 	wait := func() error {
 		if err := cmd.Wait(); err != nil {
-			return fmt.Errorf("%s: %w: %s", shellJoin(argv), err, strings.TrimSpace(stderr.String()))
+			detail := strings.TrimSpace(stderr.String())
+			if unreachable := runner.unreachable(err, detail); unreachable != nil {
+				return unreachable
+			}
+			return fmt.Errorf("%s: %w: %s", shellJoin(argv), err, detail)
 		}
 		return nil
 	}
@@ -135,4 +201,23 @@ func (runner *CmdRunner) Push(localPath, remotePath string) (string, func() erro
 		return err
 	}
 	return remotePath, cleanup, nil
+}
+
+func (runner *CmdRunner) Pull(localPath, remotePath string) (string, func() error, error) {
+	if runner.Target.IsLocal() {
+		return localPath, func() error { return nil }, nil
+	}
+	fetch := func() error {
+		argv := scpFromArgv(runner.Target, remotePath, localPath)
+		runner.trace(argv)
+		cmd := exec.Command(argv[0], argv[1:]...)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("scp %s: %w: %s", remotePath, err, strings.TrimSpace(stderr.String()))
+		}
+		_, err := runner.Run("rm", "-f", remotePath)
+		return err
+	}
+	return remotePath, fetch, nil
 }

@@ -28,12 +28,28 @@ type gpioSet struct {
 // call. A power-button press (gpioPowerBtn) toggles the power LED
 // (gpioPowerLED), modelling how a press flips host power so SetPower's poll can
 // settle.
+//
+// It also models the RTE's auto-release, against a virtual clock the driver's
+// sleep advances: a press with a hold keeps its pin down until the clock passes
+// the hold, and a press that lands while the pin is still down is recorded as an
+// overlap. An overlap is the fault a released button rules out - the platform
+// sees one continuous assertion rather than a new press.
 type fakeGPIO struct {
 	pins   map[int]rte.Pin
 	sets   []gpioSet
 	getErr error
 	setErr error
+
+	clock     time.Duration         // virtual now, moved on by advance
+	heldUntil map[int]time.Duration // per pin, when the RTE lets it back up
+	overlaps  []int                 // pins pressed again while still held
 }
+
+// advance moves the virtual clock on, standing in for the driver's sleep.
+func (f *fakeGPIO) advance(d time.Duration) { f.clock += d }
+
+// held reports whether the RTE is still holding pin id down.
+func (f *fakeGPIO) held(id int) bool { return f.clock < f.heldUntil[id] }
 
 func (f *fakeGPIO) Get(id int) (rte.Pin, error) {
 	if f.getErr != nil {
@@ -46,6 +62,15 @@ func (f *fakeGPIO) Set(id int, state string, hold int) error {
 	f.sets = append(f.sets, gpioSet{id, state, hold})
 	if f.setErr != nil {
 		return f.setErr
+	}
+	if hold > 0 {
+		if f.held(id) {
+			f.overlaps = append(f.overlaps, id)
+		}
+		if f.heldUntil == nil {
+			f.heldUntil = map[int]time.Duration{}
+		}
+		f.heldUntil[id] = f.clock + time.Duration(hold)*time.Second
 	}
 	if id == gpioPowerBtn {
 		led := f.pins[gpioPowerLED]
@@ -67,6 +92,32 @@ func (f *fakeGPIO) setIDs() []int {
 	return ids
 }
 
+// parkedBus reports whether the recorded sets contain an idle park: the mux
+// select resting on hostSelect and the mux enable driven high (disabled).
+func (f *fakeGPIO) parkedBus(hostSelect string) bool {
+	var selected, disabled bool
+	for _, s := range f.sets {
+		if s.id == gpioMuxSelect && s.state == hostSelect {
+			selected = true
+		}
+		if s.id == gpioMuxEnable && s.state == "high" {
+			disabled = true
+		}
+	}
+	return selected && disabled
+}
+
+// countSets returns how many recorded sets target id.
+func (f *fakeGPIO) countSets(id int) int {
+	n := 0
+	for _, s := range f.sets {
+		if s.id == id {
+			n++
+		}
+	}
+	return n
+}
+
 // firstSet returns the first recorded set for id, or false if none.
 func (f *fakeGPIO) firstSet(id int) (gpioSet, bool) {
 	for _, s := range f.sets {
@@ -82,8 +133,14 @@ func testBenchRack(t *testing.T, runner *fakeRunner, g *fakeGPIO) *benchRack {
 	b := newBenchRack(runner, Config{}).(*benchRack)
 	b.gpio = g
 	b.settle = 0
+	b.powerSettle = 0
+	// Point the driver's waits at the fake's clock, so a button-release wait is
+	// observed in the fake rather than waited out in the test.
+	b.sleep = g.advance
 	b.pollInterval = time.Microsecond
 	b.pollTimeout = 100 * time.Millisecond
+	b.acCycleDelay = 0
+	b.acDrainWait = 0
 	b.progress = io.Discard
 	return b
 }
@@ -156,6 +213,42 @@ func TestBenchRackSetPowerOffHoldsLong(t *testing.T) {
 	}
 }
 
+func TestBenchRackSetPowerReturnsWithTheButtonReleased(t *testing.T) {
+	// A force-off latches S5 before its hold is up, so the power state settles
+	// mid-press. Returning there leaves the button down for the next command,
+	// whose press continues the hold instead of starting one.
+	g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: 1}}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	if err := b.SetPower(PowerOff); err != nil {
+		t.Fatal(err)
+	}
+	if g.held(gpioPowerBtn) {
+		t.Error("SetPower(off) returned while the RTE still held the power button")
+	}
+}
+
+func TestBenchRackPowerResetPressesOnAfterTheForceOffReleases(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: 1}}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	if err := b.PowerReset(); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.overlaps) != 0 {
+		t.Errorf("power-reset pressed a button that was still held: pins %v", g.overlaps)
+	}
+}
+
+func TestBenchRackHardResetReturnsWithTheButtonReleased(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: 1}}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	if err := b.HardReset(); err != nil {
+		t.Fatal(err)
+	}
+	if g.held(gpioResetBtn) {
+		t.Error("HardReset returned while the RTE still held the reset button")
+	}
+}
+
 func TestBenchRackSetPowerIdempotent(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: 1}}}
 	b := testBenchRack(t, &fakeRunner{}, g)
@@ -181,6 +274,10 @@ func TestBenchRackPowerResetCycles(t *testing.T) {
 	}
 	if len(holds) != 2 || holds[0] != b.powerOffHold || holds[1] != b.powerOnHold {
 		t.Errorf("power-reset presses = %v, want [off-hold on-hold] = [%d %d]", holds, b.powerOffHold, b.powerOnHold)
+	}
+	// The reset ends with the platform powered back on.
+	if st, _ := b.PowerState(); st.Power != PowerOn {
+		t.Errorf("after reset power = %v, want on", st.Power)
 	}
 }
 
@@ -222,6 +319,71 @@ func TestBenchRackConsoleTelnetsToSer2net(t *testing.T) {
 	}
 }
 
+func TestBenchRackConsoleSOLClearsThenActivates(t *testing.T) {
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	bmc := BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}
+
+	if err := b.ConsoleSOL(bmc); err != nil {
+		t.Fatal(err)
+	}
+	// A session that ended without "~." leaves the payload open, so the deactivate
+	// must precede the activate.
+	if len(runner.sequence) != 3 {
+		t.Fatalf("ConsoleSOL calls = %d, want 3 (deactivate, activate, deactivate)", len(runner.sequence))
+	}
+	for i, want := range []string{"sol deactivate", "sol activate", "sol deactivate"} {
+		got := strings.Join(runner.sequence[i], " ")
+		if !strings.Contains(got, want) || !strings.Contains(got, bmc.IP) {
+			t.Errorf("call %d = %q, want %s against %s", i, got, want, bmc.IP)
+		}
+	}
+	if !runner.noEscape[0] {
+		t.Error("ConsoleSOL attached with the ssh escape character live, so \"~.\" would not reach ipmitool")
+	}
+}
+
+func TestBenchRackConsoleSOLStopsWhenTheBMCDoesNotAnswer(t *testing.T) {
+	// The deactivate opens a session of its own, so a BMC that never answers is
+	// known there, and attaching would only wait out the same timeout again.
+	runner := &fakeRunner{handler: func(int, []string) (string, error) {
+		return "", errors.New("exit status 1: Error: Unable to establish IPMI v2 / RMCP+ session")
+	}}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	err := b.ConsoleSOL(BMC{IP: "192.168.10.192", User: "admin", Password: "Administrator"})
+	if err == nil {
+		t.Fatal("ConsoleSOL should report a BMC that did not answer")
+	}
+	if !strings.Contains(err.Error(), "192.168.10.192") {
+		t.Errorf("error %q should name the BMC", err)
+	}
+	if len(runner.interactive) != 0 {
+		t.Error("ConsoleSOL attached over a BMC session it could not open")
+	}
+}
+
+func TestBenchRackConsoleSOLRequiresAddress(t *testing.T) {
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ConsoleSOL(BMC{User: "admin", Password: "Administrator"}); err == nil {
+		t.Fatal("ConsoleSOL should error without a BMC address")
+	}
+	if len(runner.calls) != 0 || len(runner.interactive) != 0 {
+		t.Error("ConsoleSOL ran ipmitool without a BMC address")
+	}
+	if g := b.gpio.(*fakeGPIO); len(g.sets) != 0 {
+		t.Errorf("ConsoleSOL without a BMC address set %v, want no GPIO writes", g.sets)
+	}
+}
+
+func TestBenchRackConsoleSOLReportsActivateFailure(t *testing.T) {
+	runner := &fakeRunner{interactiveErr: errors.New("SOL payload already active")}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ConsoleSOL(BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}); err == nil {
+		t.Fatal("ConsoleSOL should report an activate failure")
+	}
+}
+
 func TestBenchRackFlashHostSequence(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{
 		gpioEnBMC:  {Direction: "out", State: 0},
@@ -233,13 +395,13 @@ func TestBenchRackFlashHostSequence(t *testing.T) {
 	b := testBenchRack(t, runner, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
 
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 
-	// Energize order: voltage, mux select, mux enable, Vcc, lines (no switch:
-	// powerSwitches off).
-	want := []int{gpioSpiVoltage, gpioMuxSelect, gpioMuxEnable, gpioSpiVcc, gpioSpiLines}
+	// Energize order: voltage, mux select, mux enable, Vcc, host load switch,
+	// lines.
+	want := []int{gpioSpiVoltage, gpioMuxSelect, gpioMuxEnable, gpioSpiVcc, gpioEnHost, gpioSpiLines}
 	var got []int
 	// Reconstruct the energize prefix: take sets until SPI lines is first turned on.
 	for _, s := range g.sets {
@@ -251,7 +413,7 @@ func TestBenchRackFlashHostSequence(t *testing.T) {
 	if len(got) < len(want) {
 		t.Fatalf("energize sets = %v, want to include %v", got, want)
 	}
-	// The last four before (and including) lines-on must be the energize order.
+	// The last six before (and including) lines-on must be the energize order.
 	tail := got[len(got)-len(want):]
 	for i := range want {
 		if tail[i] != want[i] {
@@ -290,7 +452,7 @@ func TestBenchRackFlashMuxEnableInterlock(t *testing.T) {
 	}}
 	b := testBenchRack(t, &fakeRunner{}, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -321,21 +483,213 @@ func TestBenchRackFlashMuxEnableInterlock(t *testing.T) {
 	}
 }
 
+func TestBenchRackFlashMuxSelectDefaultsToHost(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	b := testBenchRack(t, &fakeRunner{handler: tasmotaReplies()}, g)
+	fw := writeSized(t, int(b.board.bmc.sizeBytes))
+	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
+		t.Fatal(err)
+	}
+	// The flash routes the mux to the BMC, but the bus must return to the host
+	// branch afterward: resting the select on the BMC freezes it even with the
+	// mux disabled.
+	lastMuxSelect := ""
+	for _, s := range g.sets {
+		if s.id == gpioMuxSelect {
+			lastMuxSelect = s.state
+		}
+	}
+	if lastMuxSelect != b.board.host.muxSelect {
+		t.Errorf("mux select final state = %q, want %q (host is the idle default)", lastMuxSelect, b.board.host.muxSelect)
+	}
+}
+
 func TestBenchRackFlashBMCOmitsChip(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{
 		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
 	}}
-	runner := &fakeRunner{}
+	runner := &fakeRunner{handler: tasmotaReplies()}
 	b := testBenchRack(t, runner, g)
 	fw := writeSized(t, int(b.board.bmc.sizeBytes))
 
-	if err := b.Flash(FlashBMC, fw, false); err != nil {
+	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, call := range runner.calls {
 		if len(call) > 0 && call[0] == "flashrom" && strings.Contains(strings.Join(call, " "), "-c ") {
 			t.Errorf("BMC flashrom argv = %q, should not pass -c (auto-detect)", strings.Join(call, " "))
 		}
+	}
+}
+
+func TestBenchRackFlashBMCRemovesMainsFirst(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	// Record the AC switches and how far the GPIO sequence had got when mains was
+	// dropped, so the energize steps can be placed relative to it.
+	var switches []string
+	setsAtACOff := -1
+	reply := tasmotaReplies()
+	runner := &fakeRunner{}
+	runner.handler = func(call int, argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "Power%20OFF") {
+			switches = append(switches, "off")
+			setsAtACOff = len(g.sets)
+		} else {
+			switches = append(switches, "on")
+		}
+		return reply(call, argv)
+	}
+	b := testBenchRack(t, runner, g)
+	fw := writeSized(t, int(b.board.bmc.sizeBytes))
+
+	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mains goes off once and stays off: the BMC comes back only on `power ac on`.
+	if len(switches) != 1 || switches[0] != "off" {
+		t.Fatalf("BMC flash AC switches = %v, want a single off", switches)
+	}
+	// Nothing energizes the BMC branch before mains is gone.
+	for i, s := range g.sets[:setsAtACOff] {
+		energized := (s.id == gpioMuxEnable && s.state == "low") ||
+			(s.id == gpioSpiLines && s.state == "low") ||
+			(s.id == gpioSpiVcc && s.state == "low") ||
+			(s.id == gpioEnBMC && s.state == "high")
+		if energized {
+			t.Errorf("set %+v at %d energized the BMC branch before mains was removed", s, i)
+		}
+	}
+}
+
+func TestBenchRackFlashBMCWaitsAfterMainsOff(t *testing.T) {
+	// The board holds the bus for a moment after mains goes away, so the flash
+	// waits before it energizes the branch.
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	b := testBenchRack(t, &fakeRunner{handler: tasmotaReplies()}, g)
+	b.acDrainWait = 20 * time.Millisecond
+	fw := writeSized(t, int(b.board.bmc.sizeBytes))
+
+	start := time.Now()
+	if err := b.FlashWrite(FlashBMC, fw, false); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < b.acDrainWait {
+		t.Errorf("BMC flash took %s, want at least the %s drain wait", elapsed, b.acDrainWait)
+	}
+}
+
+func TestBenchRackFlashHostLeavesMainsAlone(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	runner := &fakeRunner{handler: tasmotaReplies()}
+	b := testBenchRack(t, runner, g)
+	fw := writeSized(t, int(b.board.host.sizeBytes))
+
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
+		t.Fatal(err)
+	}
+	if calls := curlCalls(runner); len(calls) != 0 {
+		t.Errorf("host flash curl calls = %v, want none (the host flash does not touch mains)", calls)
+	}
+}
+
+func TestBenchRackFlashBMCNeedsACControl(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	b.tasmota = nil
+
+	err := b.FlashProbe(FlashBMC)
+	if err == nil || !strings.Contains(err.Error(), "mains") {
+		t.Fatalf("BMC flash without AC control = %v, want an error about removing mains", err)
+	}
+	if len(g.sets) != 0 {
+		t.Errorf("refused BMC flash drove %v, want the bench left untouched", g.setIDs())
+	}
+}
+
+func TestBenchRackFlashProbeDetectsWithoutReadOrWrite(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	runner := &fakeRunner{streamOut: "Found chip\n"}
+	b := testBenchRack(t, runner, g)
+
+	if err := b.FlashProbe(FlashHost); err != nil {
+		t.Fatal(err)
+	}
+
+	var flashArgv []string
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "flashrom" {
+			flashArgv = call
+		}
+	}
+	if flashArgv == nil {
+		t.Fatal("flashrom was not run")
+	}
+	joined := strings.Join(flashArgv, " ")
+	if strings.Contains(joined, "-r ") || strings.Contains(joined, "-w ") {
+		t.Errorf("probe flashrom argv = %q, should neither read nor write", joined)
+	}
+	if !strings.Contains(joined, "-c "+b.board.host.chip) {
+		t.Errorf("probe flashrom argv = %q, want -c %s for host", joined, b.board.host.chip)
+	}
+	if runner.pushed || runner.pulled {
+		t.Errorf("probe pushed=%v pulled=%v, want neither (no image transfer)", runner.pushed, runner.pulled)
+	}
+}
+
+func TestBenchRackFlashReadPullsImageBack(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, g)
+	out := filepath.Join(t.TempDir(), "dump.bin")
+
+	if err := b.FlashRead(FlashHost, out); err != nil {
+		t.Fatal(err)
+	}
+
+	var flashArgv []string
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "flashrom" {
+			flashArgv = call
+		}
+	}
+	if flashArgv == nil {
+		t.Fatal("flashrom was not run")
+	}
+	joined := strings.Join(flashArgv, " ")
+	if !strings.Contains(joined, "-r ") || strings.Contains(joined, "-w ") {
+		t.Errorf("read flashrom argv = %q, want -r and not -w", joined)
+	}
+	if !runner.pulled {
+		t.Error("read did not pull the image back from the bench")
+	}
+
+	// The bus is de-energized afterward: lines high-z and the mux disabled.
+	lastState := func(id int) string {
+		state := ""
+		for _, s := range g.sets {
+			if s.id == id {
+				state = s.state
+			}
+		}
+		return state
+	}
+	if lastState(gpioSpiLines) != "high-z" || lastState(gpioMuxEnable) != "high" {
+		t.Errorf("after read lines=%q mux=%q, want lines high-z and mux disabled", lastState(gpioSpiLines), lastState(gpioMuxEnable))
 	}
 }
 
@@ -349,7 +703,7 @@ func TestBenchRackFlashExportsEGPAOnFirstRun(t *testing.T) {
 	}}
 	b := testBenchRack(t, &fakeRunner{}, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -378,7 +732,7 @@ func TestBenchRackFlashParksLiveBusOff(t *testing.T) {
 	}}
 	b := testBenchRack(t, &fakeRunner{}, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 	// First action on Vcc and lines must be an off (high-z), before mux select.
@@ -407,7 +761,7 @@ func TestBenchRackFlashEnablesSwitchWhenConfigured(t *testing.T) {
 	b := testBenchRack(t, &fakeRunner{}, g)
 	b.board.powerSwitches = true
 	fw := writeSized(t, int(b.board.host.sizeBytes))
-	if err := b.Flash(FlashHost, fw, false); err != nil {
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
 		t.Fatal(err)
 	}
 	// The host branch switch is enabled high at some point during the flash.
@@ -422,6 +776,42 @@ func TestBenchRackFlashEnablesSwitchWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestBenchRackFlashPowersRailBeforeSwitch(t *testing.T) {
+	g := &fakeGPIO{pins: map[int]rte.Pin{
+		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
+	}}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	fw := writeSized(t, int(b.board.host.sizeBytes))
+	if err := b.FlashWrite(FlashHost, fw, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// idx returns the position of the first set matching (id, state), or -1.
+	idx := func(id int, state string) int {
+		for i, s := range g.sets {
+			if s.id == id && s.state == state {
+				return i
+			}
+		}
+		return -1
+	}
+	vccOn := idx(gpioSpiVcc, "low")
+	switchOn := idx(gpioEnHost, "high")
+	switchOff := idx(gpioEnHost, "low")
+	vccOff := idx(gpioSpiVcc, "high-z")
+	if vccOn < 0 || switchOn < 0 || switchOff < 0 || vccOff < 0 {
+		t.Fatalf("missing a power set: vccOn=%d switchOn=%d switchOff=%d vccOff=%d", vccOn, switchOn, switchOff, vccOff)
+	}
+	// Power up: the RTE Vcc rail comes on before the load switch closes.
+	if vccOn > switchOn {
+		t.Errorf("Vcc on at %d, after the load switch at %d, want the rail up first", vccOn, switchOn)
+	}
+	// Power down: the load switch opens before the RTE Vcc rail drops.
+	if switchOff > vccOff {
+		t.Errorf("load switch off at %d, after Vcc at %d, want the switch open first", switchOff, vccOff)
+	}
+}
+
 func TestBenchRackFlashSizeCheck(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{
 		gpioEnBMC: {Direction: "out"}, gpioEnHost: {Direction: "out"}, gpioPowerLED: {State: 0},
@@ -429,11 +819,11 @@ func TestBenchRackFlashSizeCheck(t *testing.T) {
 	b := testBenchRack(t, &fakeRunner{}, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes)-1)
 
-	if err := b.Flash(FlashHost, fw, false); err == nil {
-		t.Fatal("Flash should reject a wrong-sized image without --force")
+	if err := b.FlashWrite(FlashHost, fw, false); err == nil {
+		t.Fatal("FlashWrite should reject a wrong-sized image without --force")
 	}
-	if err := b.Flash(FlashHost, fw, true); err != nil {
-		t.Errorf("Flash --force should skip the size check, got %v", err)
+	if err := b.FlashWrite(FlashHost, fw, true); err != nil {
+		t.Errorf("FlashWrite --force should skip the size check, got %v", err)
 	}
 }
 
@@ -445,8 +835,8 @@ func TestBenchRackFlashRestoresOnError(t *testing.T) {
 	b := testBenchRack(t, runner, g)
 	fw := writeSized(t, int(b.board.host.sizeBytes))
 
-	if err := b.Flash(FlashHost, fw, false); err == nil {
-		t.Fatal("Flash should surface a flashrom failure")
+	if err := b.FlashWrite(FlashHost, fw, false); err == nil {
+		t.Fatal("FlashWrite should surface a flashrom failure")
 	}
 	// The bus must be de-energized even on failure: last Vcc and lines sets off.
 	lastState := func(id int) string {
@@ -481,6 +871,203 @@ func TestBenchRackUnknownBoardErrors(t *testing.T) {
 	driver := newBenchRack(&fakeRunner{}, Config{Board: "no-such-board"})
 	if _, err := driver.PowerState(); err == nil || !strings.Contains(err.Error(), "no-such-board") {
 		t.Errorf("PowerState with unknown board = %v, want an error naming the board", err)
+	}
+}
+
+// curlCalls returns the joined argv of every recorded curl call, in order.
+func curlCalls(runner *fakeRunner) []string {
+	var out []string
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "curl" {
+			out = append(out, strings.Join(call, " "))
+		}
+	}
+	return out
+}
+
+func TestBenchRackACStateReadsTasmota(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		want Power
+	}{
+		{`{"POWER":"ON"}`, PowerOn},
+		{`{"POWER":"OFF"}`, PowerOff},
+	} {
+		runner := &fakeRunner{handler: func(int, []string) (string, error) { return tc.body, nil }}
+		b := testBenchRack(t, runner, &fakeGPIO{})
+		got, err := b.ACPowerState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Power != tc.want {
+			t.Errorf("ACPowerState from %s = %v, want %v", tc.body, got.Power, tc.want)
+		}
+		calls := curlCalls(runner)
+		if len(calls) != 1 || !strings.Contains(calls[0], defaultTasmotaIP) || !strings.Contains(calls[0], "cmnd=Power") {
+			t.Errorf("ACPowerState curl calls = %v, want one read of the default Tasmota", calls)
+		}
+	}
+}
+
+func TestBenchRackSetACPowerSwitchesAndConfirms(t *testing.T) {
+	runner := &fakeRunner{handler: func(_ int, argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "Power%20ON") {
+			return `{"POWER":"ON"}`, nil
+		}
+		return `{"POWER":"OFF"}`, nil
+	}}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.SetACPower(PowerOn); err != nil {
+		t.Fatal(err)
+	}
+	calls := curlCalls(runner)
+	if len(calls) != 1 || !strings.Contains(calls[0], "Power%20ON") {
+		t.Errorf("SetACPower(on) curl calls = %v, want one Power ON switch", calls)
+	}
+}
+
+func TestBenchRackSetACPowerErrorsOnMismatch(t *testing.T) {
+	// The plug reports the opposite of what was requested (e.g. relay stuck).
+	runner := &fakeRunner{handler: func(int, []string) (string, error) { return `{"POWER":"OFF"}`, nil }}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.SetACPower(PowerOn); err == nil {
+		t.Fatal("SetACPower should error when the Tasmota does not reach the requested state")
+	}
+}
+
+func TestBenchRackACPowerCycleOffThenOn(t *testing.T) {
+	var order []string
+	runner := &fakeRunner{handler: func(_ int, argv []string) (string, error) {
+		j := strings.Join(argv, " ")
+		switch {
+		case strings.Contains(j, "Power%20OFF"):
+			order = append(order, "off")
+			return `{"POWER":"OFF"}`, nil
+		case strings.Contains(j, "Power%20ON"):
+			order = append(order, "on")
+			return `{"POWER":"ON"}`, nil
+		}
+		return `{"POWER":"OFF"}`, nil
+	}}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ACPowerCycle(); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "off" || order[1] != "on" {
+		t.Errorf("AC cycle order = %v, want [off on]", order)
+	}
+}
+
+func TestBenchRackACNotImplementedWithoutTasmota(t *testing.T) {
+	b := testBenchRack(t, &fakeRunner{}, &fakeGPIO{})
+	b.tasmota = nil
+	if _, err := b.ACPowerState(); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("ACPowerState = %v, want ErrNotImplemented", err)
+	}
+	if err := b.SetACPower(PowerOn); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("SetACPower = %v, want ErrNotImplemented", err)
+	}
+	if err := b.ACPowerCycle(); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("ACPowerCycle = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestBenchRackTasmotaIPOverride(t *testing.T) {
+	runner := &fakeRunner{handler: func(int, []string) (string, error) { return `{"POWER":"OFF"}`, nil }}
+	b := newBenchRack(runner, Config{TasmotaIP: "10.1.2.3"}).(*benchRack)
+	b.gpio = &fakeGPIO{}
+	if _, err := b.ACPowerState(); err != nil {
+		t.Fatal(err)
+	}
+	calls := curlCalls(runner)
+	if len(calls) != 1 || !strings.Contains(calls[0], "10.1.2.3") {
+		t.Errorf("override curl calls = %v, want the configured IP 10.1.2.3", calls)
+	}
+}
+
+// tasmotaReplies answers a Tasmota read or switch with the state the command
+// asked for, so an AC operation confirms and returns.
+func tasmotaReplies() func(int, []string) (string, error) {
+	return func(_ int, argv []string) (string, error) {
+		if strings.Contains(strings.Join(argv, " "), "Power%20OFF") {
+			return `{"POWER":"OFF"}`, nil
+		}
+		return `{"POWER":"ON"}`, nil
+	}
+}
+
+// benchCommand is one exported driver operation, with the power-LED state it
+// needs to run without erroring.
+type benchCommand struct {
+	name string
+	led  uint
+	run  func(*benchRack) error
+}
+
+// powerCommands are the operations that do not drive the flash bus themselves.
+var powerCommands = []benchCommand{
+	{"PowerState", 1, func(b *benchRack) error { _, err := b.PowerState(); return err }},
+	{"SetPower", 0, func(b *benchRack) error { return b.SetPower(PowerOn) }},
+	{"PowerReset", 1, func(b *benchRack) error { return b.PowerReset() }},
+	{"HardReset", 1, func(b *benchRack) error { return b.HardReset() }},
+	{"Console", 1, func(b *benchRack) error { return b.Console() }},
+	{"ConsoleSOL", 1, func(b *benchRack) error {
+		return b.ConsoleSOL(BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"})
+	}},
+	{"ACPowerState", 1, func(b *benchRack) error { _, err := b.ACPowerState(); return err }},
+	{"SetACPower", 1, func(b *benchRack) error { return b.SetACPower(PowerOn) }},
+	{"ACPowerCycle", 1, func(b *benchRack) error { return b.ACPowerCycle() }},
+}
+
+func TestBenchRackPowerCommandsParkFlashBus(t *testing.T) {
+	// A flash left energized by a killed run or an RTE reboot must not survive
+	// into the next command: every operation parks the bus and the load switches
+	// before it touches the bench.
+	for _, tc := range powerCommands {
+		g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: tc.led}}}
+		b := testBenchRack(t, &fakeRunner{handler: tasmotaReplies()}, g)
+		if err := tc.run(b); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if !g.parkedBus(b.board.host.muxSelect) {
+			t.Errorf("%s did not park the flash bus, sets = %v", tc.name, g.sets)
+		}
+	}
+}
+
+func TestBenchRackParksOncePerCommand(t *testing.T) {
+	// Parking writes to the mux, so it belongs once at the start of a command.
+	// A command that parks per power reading would rewrite the mux throughout
+	// the poll loop.
+	for _, tc := range powerCommands {
+		g := &fakeGPIO{pins: map[int]rte.Pin{gpioPowerLED: {State: tc.led}}}
+		b := testBenchRack(t, &fakeRunner{handler: tasmotaReplies()}, g)
+		if err := tc.run(b); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got := g.countSets(gpioMuxEnable); got != 1 {
+			t.Errorf("%s parked %d times, want 1", tc.name, got)
+		}
+	}
+}
+
+func TestBenchRackACWithoutTasmotaLeavesGPIOUntouched(t *testing.T) {
+	// An unsupported operation reports ErrNotImplemented without parking, so it
+	// leaves the bench exactly as it found it.
+	for _, tc := range []benchCommand{
+		{"ACPowerState", 1, func(b *benchRack) error { _, err := b.ACPowerState(); return err }},
+		{"SetACPower", 1, func(b *benchRack) error { return b.SetACPower(PowerOn) }},
+		{"ACPowerCycle", 1, func(b *benchRack) error { return b.ACPowerCycle() }},
+	} {
+		g := &fakeGPIO{}
+		b := testBenchRack(t, &fakeRunner{}, g)
+		b.tasmota = nil
+		if err := tc.run(b); !errors.Is(err, ErrNotImplemented) {
+			t.Fatalf("%s = %v, want ErrNotImplemented", tc.name, err)
+		}
+		if len(g.sets) != 0 {
+			t.Errorf("%s on a board without AC control set %v, want no GPIO writes", tc.name, g.sets)
+		}
 	}
 }
 

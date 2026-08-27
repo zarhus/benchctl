@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"github.com/zarhus/benchctl/exec"
+	"github.com/zarhus/benchctl/internal/ipmi"
 	"github.com/zarhus/benchctl/internal/rte"
+	"github.com/zarhus/benchctl/internal/tasmota"
 )
 
 // BenchRack is the RTE-based bench. The driver controls GPIO, the SPI mux, and
 // power over the RTE REST API, and runs flashrom over SSH. flashrom runs
-// synchronously inside a Flash call, so there is no update state to query or
+// synchronously within a flash command, so there is no update state to query or
 // abort between invocations. FlashStatus and FlashAbort report ErrNotImplemented.
 
 func init() {
@@ -40,8 +42,8 @@ const (
 	gpioResetBtn   = 8  // DUT reset button
 	gpioPowerBtn   = 9  // DUT power button
 	gpioMuxEnable  = 13 // GPIO400, 2:1 mux enable (active-low): high isolates both flashes, low routes the selected branch
-	gpioEnBMC      = 14 // E_GPA1, BMC load-switch enable: high on, low off
-	gpioEnHost     = 15 // E_GPA2, host load-switch enable
+	gpioEnHost     = 14 // E_GPA1, host load-switch enable
+	gpioEnBMC      = 15 // E_GPA2, BMC load-switch enable: high on, low off
 	gpioMuxSelect  = 16 // 2:1 mux select
 	gpioPowerLED   = 17 // DUT power LED readback (led1, J1 pin 1 / GPIO12): high on, low off
 )
@@ -60,6 +62,7 @@ type targetCfg struct {
 	sizeBytes int64  // expected firmware size
 	muxSelect string // mux-select level ("high"/"low") that routes to this flash
 	enable    int    // load-switch enable pin id for this flash
+	acOff     bool   // remove mains before flashing: this chip's owner runs on standby power
 }
 
 // consoleCfg is where the DUT serial console is reached. The RTE runs ser2net,
@@ -74,26 +77,36 @@ type board struct {
 	bmc           targetCfg
 	powerSwitches bool // enable the selected branch's load switch during a flash
 	console       consoleCfg
+	tasmotaIP     string // AC-control Tasmota plug address; empty means the board has no AC control
 }
 
 const defaultBoard = "asrock-turin"
 
-// remoteFirmware is where Flash stages the image on the RTE. It lives on /data
-// (persistent storage) rather than /var/tmp (tmpfs): the RTE has little free
-// RAM, and flashrom already holds roughly twice the flash size in memory to
+// defaultTasmotaIP is where the plug sits on the RTE's isolated wifi AP: the
+// single-address DHCP pool always hands it this address.
+const defaultTasmotaIP = "192.168.66.50"
+
+// remoteFirmware is where FlashWrite stages the image on the RTE. It lives on
+// /data (persistent storage) rather than /var/tmp (tmpfs): the RTE has little
+// free RAM, and flashrom already holds roughly twice the flash size in memory to
 // write and verify, so staging the image in RAM as well can exhaust it on a
 // 64 MB flash. The name is fixed, so each flash overwrites the last.
 const remoteFirmware = "/data/rom.bin"
 
+// remoteReadback is where FlashRead has flashrom write the chip image on the RTE
+// before it is copied back to the caller. It lives on /data for the same reason
+// as remoteFirmware, and its fixed name means each read overwrites the last.
+const remoteReadback = "/data/readback.bin"
+
 var boards = map[string]board{
 	"asrock-turin": {
-		host: targetCfg{chip: "W25Q256JV_Q", voltage: "3.3V", sizeBytes: 32 * 1024 * 1024, muxSelect: "high", enable: gpioEnHost},
-		bmc:  targetCfg{chip: "", voltage: "3.3V", sizeBytes: 64 * 1024 * 1024, muxSelect: "low", enable: gpioEnBMC},
-		// The Turin demo uses a shared SPI Vcc rail, so no per-flash switch.
-		powerSwitches: false,
+		host:          targetCfg{chip: "W25Q256JV_Q", voltage: "3.3V", sizeBytes: 32 * 1024 * 1024, muxSelect: "low", enable: gpioEnHost},
+		bmc:           targetCfg{chip: "", voltage: "3.3V", sizeBytes: 64 * 1024 * 1024, muxSelect: "high", enable: gpioEnBMC, acOff: true},
+		powerSwitches: true,
 		// TODO(bring-up): confirm the mux-select polarity against the hardware.
 		// ser2net.yaml maps /dev/ttyS1 (115200n81) to telnet port 13541.
-		console: consoleCfg{port: 13541},
+		console:   consoleCfg{port: 13541},
+		tasmotaIP: defaultTasmotaIP,
 	},
 }
 
@@ -109,8 +122,10 @@ func boardNames() string {
 type benchRack struct {
 	runner   exec.Runner
 	gpio     gpioController
+	tasmota  *tasmota.Client // AC power control; nil when the board declares no Tasmota
 	board    board
 	boardErr error // set when the requested board is unknown
+	idled    bool  // parkOff has driven the bus to its off state, see ensureIdle
 
 	spiDev   string
 	spiSpeed int
@@ -118,9 +133,23 @@ type benchRack struct {
 
 	pollInterval time.Duration
 	pollTimeout  time.Duration
-	powerOnHold  int // power-button pulse, seconds, to power on
-	powerOffHold int // power-button hold, seconds, to force S5 off
-	resetHold    int // reset-button pulse, seconds
+	powerOnHold  int           // power-button pulse, seconds, to power on
+	powerOffHold int           // power-button hold, seconds, to force S5 off
+	resetHold    int           // reset-button pulse, seconds
+	acCycleDelay time.Duration // off-to-on gap during an AC power-cycle
+	// acDrainWait is the gap a flash leaves between removing mains and energizing
+	// the bus, so the standby rails discharge and the chip's owner stops driving
+	// the flash before the RTE takes it over.
+	acDrainWait time.Duration
+	// powerSettle is the gap left after a button comes back up, so the platform
+	// has settled in the state the press asked for before anything presses again.
+	powerSettle time.Duration
+	// sleep waits out a delay, time.Sleep in a driver that drives a bench. It is
+	// a field because the button-release wait is derived from the hold the RTE
+	// was given rather than from a constant a test can zero, so a test points it
+	// at a clock it controls and asserts the button is up when a power operation
+	// returns.
+	sleep func(time.Duration)
 
 	progress io.Writer
 }
@@ -141,6 +170,10 @@ func newBenchRack(runner exec.Runner, cfg Config) Platform {
 		powerOnHold:  1,
 		powerOffHold: 6,
 		resetHold:    1,
+		acCycleDelay: 2 * time.Second,
+		acDrainWait:  5 * time.Second,
+		powerSettle:  3 * time.Second,
+		sleep:        time.Sleep,
 		progress:     os.Stderr,
 	}
 	brd, ok := boards[name]
@@ -149,6 +182,16 @@ func newBenchRack(runner exec.Runner, cfg Config) Platform {
 		return bench
 	}
 	bench.board = brd
+	// A Tasmota address from the config overrides the board default, and enables
+	// AC control on a board that declares none. When neither supplies one, the
+	// board has no AC control and the AC methods report ErrNotImplemented.
+	ip := cfg.TasmotaIP
+	if ip == "" {
+		ip = brd.tasmotaIP
+	}
+	if ip != "" {
+		bench.tasmota = tasmota.New(runner, ip)
+	}
 	return bench
 }
 
@@ -163,9 +206,29 @@ func (bench *benchRack) target(t FlashTarget) (targetCfg, error) {
 	}
 }
 
-func (bench *benchRack) PowerState() (PowerStatus, error) {
+// ensureIdle brings the bench to its resting state before an operation touches
+// it, and does so once per driver instance. Parking writes to the mux, so
+// repeating it inside the power poll would rewrite the mux on every reading.
+// Because it is a no-op after the first call, an operation can park up front and
+// still delegate to another exported one.
+//
+// Every exported operation calls it first. deenergize runs only as a defer, so a
+// flash killed mid-run or interrupted by an RTE reboot leaves the SPI rail up and
+// a load switch closed. Parking here means a later command cannot energize the
+// board while the RTE still drives a flash.
+func (bench *benchRack) ensureIdle() error {
 	if bench.boardErr != nil {
-		return PowerStatus{}, bench.boardErr
+		return bench.boardErr
+	}
+	if bench.idled {
+		return nil
+	}
+	return bench.parkOff()
+}
+
+func (bench *benchRack) PowerState() (PowerStatus, error) {
+	if err := bench.ensureIdle(); err != nil {
+		return PowerStatus{}, err
 	}
 	pin, err := bench.gpio.Get(gpioPowerLED)
 	if err != nil {
@@ -179,8 +242,8 @@ func (bench *benchRack) PowerState() (PowerStatus, error) {
 }
 
 func (bench *benchRack) SetPower(target Power) error {
-	if bench.boardErr != nil {
-		return bench.boardErr
+	if err := bench.ensureIdle(); err != nil {
+		return err
 	}
 	cur, err := bench.PowerState()
 	if err != nil {
@@ -197,7 +260,23 @@ func (bench *benchRack) SetPower(target Power) error {
 	if err := bench.gpio.Set(gpioPowerBtn, "low", hold); err != nil {
 		return err
 	}
+	bench.awaitRelease(hold)
 	return bench.pollPower(target)
+}
+
+// awaitRelease waits for a button the RTE is holding to come back up, and for
+// the platform to settle once it has.
+//
+// The RTE answers a press as soon as it accepts the request and releases the pin
+// holdSecs later, so the press outlives the call that made it. An ATX force-off
+// latches S5 partway through its hold, which means the power state can read the
+// transition while the button is still down: polling alone would report a
+// finished transition mid-press. Waiting here is what lets a power operation that
+// has returned mean the button is up, so the next press - from PowerReset below,
+// or from the next benchctl the caller runs - is an edge the platform acts on
+// rather than a continuation of a hold that leaves the host where it is.
+func (bench *benchRack) awaitRelease(holdSecs int) {
+	bench.sleep(time.Duration(holdSecs)*time.Second + bench.powerSettle)
 }
 
 func (bench *benchRack) pollPower(target Power) error {
@@ -218,8 +297,8 @@ func (bench *benchRack) pollPower(target Power) error {
 }
 
 func (bench *benchRack) PowerReset() error {
-	if bench.boardErr != nil {
-		return bench.boardErr
+	if err := bench.ensureIdle(); err != nil {
+		return err
 	}
 	fmt.Fprintln(bench.progress, "Power-cycling host...")
 	if err := bench.SetPower(PowerOff); err != nil {
@@ -229,8 +308,8 @@ func (bench *benchRack) PowerReset() error {
 }
 
 func (bench *benchRack) HardReset() error {
-	if bench.boardErr != nil {
-		return bench.boardErr
+	if err := bench.ensureIdle(); err != nil {
+		return err
 	}
 	status, err := bench.PowerState()
 	if err != nil {
@@ -240,19 +319,139 @@ func (bench *benchRack) HardReset() error {
 		return fmt.Errorf("host is %s, use a hard reset only when the host is powered on and a normal reset does not work", status)
 	}
 	fmt.Fprintln(bench.progress, "Resetting host via reset button...")
-	return bench.gpio.Set(gpioResetBtn, "low", bench.resetHold)
+	if err := bench.gpio.Set(gpioResetBtn, "low", bench.resetHold); err != nil {
+		return err
+	}
+	bench.awaitRelease(bench.resetHold)
+	return nil
+}
+
+// acClient returns the Tasmota client, or ErrNotImplemented when the board has
+// no AC control configured. It reports an unsupported board before parking, so
+// an operation the platform cannot perform leaves the bench untouched.
+func (bench *benchRack) acClient() (*tasmota.Client, error) {
+	if bench.boardErr != nil {
+		return nil, bench.boardErr
+	}
+	if bench.tasmota == nil {
+		return nil, ErrNotImplemented
+	}
+	if err := bench.ensureIdle(); err != nil {
+		return nil, err
+	}
+	return bench.tasmota, nil
+}
+
+// ACPowerState reports whether mains is applied to the PSU. It says nothing
+// about whether the host booted: reading the power LED (PowerState) remains the
+// real host-power signal.
+func (bench *benchRack) ACPowerState() (PowerStatus, error) {
+	client, err := bench.acClient()
+	if err != nil {
+		return PowerStatus{}, err
+	}
+	on, err := client.Power()
+	if err != nil {
+		return PowerStatus{}, err
+	}
+	return PowerStatus{Power: acPower(on)}, nil
+}
+
+// SetACPower switches the mains feed and confirms the Tasmota reached the
+// requested state. It does not press the power button or wait on the host: with
+// AC-recovery set to power on after loss, applying mains boots the DUT on its
+// own, otherwise the host stays in S5 and a separate power on is needed.
+func (bench *benchRack) SetACPower(target Power) error {
+	client, err := bench.acClient()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(bench.progress, "Switching AC %s...\n", target)
+	on, err := client.SetPower(target == PowerOn)
+	if err != nil {
+		return err
+	}
+	if got := acPower(on); got != target {
+		return fmt.Errorf("AC did not switch %s, Tasmota reports %s", target, got)
+	}
+	return nil
+}
+
+// ACPowerCycle drops mains and reapplies it after a short delay, forcing a cold
+// AC kill the front-panel button cannot.
+func (bench *benchRack) ACPowerCycle() error {
+	if _, err := bench.acClient(); err != nil {
+		return err
+	}
+	fmt.Fprintln(bench.progress, "Power-cycling AC...")
+	if err := bench.SetACPower(PowerOff); err != nil {
+		return err
+	}
+	time.Sleep(bench.acCycleDelay)
+	return bench.SetACPower(PowerOn)
+}
+
+// acPower maps the Tasmota on/off reading to a Power value.
+func acPower(on bool) Power {
+	if on {
+		return PowerOn
+	}
+	return PowerOff
 }
 
 func (bench *benchRack) Console() error {
+	if err := bench.ensureIdle(); err != nil {
+		return err
+	}
+	port := strconv.Itoa(bench.board.console.port)
+	return ConsoleSession{
+		What:   "host console via telnet on port " + port,
+		Detach: `CTRL+] then "quit"`,
+		Attach: []string{"telnet", "localhost", port},
+	}.Run(bench.runner, bench.progress)
+}
+
+// ConsoleSOL attaches to the host console over the BMC's IPMI serial-over-LAN
+// payload. It is the way to the host when the motherboard serial port that
+// Console reaches carries BMC output instead, which is how OpenBMC is often
+// configured.
+func (bench *benchRack) ConsoleSOL(bmc BMC) error {
 	if bench.boardErr != nil {
 		return bench.boardErr
 	}
-	port := strconv.Itoa(bench.board.console.port)
-	fmt.Fprintf(bench.progress, "Attaching to host console via ser2net on port %s. Detach with CTRL+] then \"quit\".\n", port)
-	return bench.runner.RunInteractive("telnet", "localhost", port)
+	// Reject a missing address before parking, so a call the driver cannot act on
+	// leaves the bench untouched.
+	if bmc.IP == "" {
+		return fmt.Errorf("no BMC address for the SOL console")
+	}
+	if err := bench.ensureIdle(); err != nil {
+		return err
+	}
+	client := ipmi.New(bmc.IP, bmc.User, bmc.Password)
+	return ConsoleSession{
+		What:   "host console over IPMI SOL at " + bmc.IP,
+		Detach: `"~." at the start of a line`,
+		Attach: client.SOLActivate(),
+		// A session that ended without "~." leaves the payload open on the BMC and
+		// the next activate then refuses to run. On a bench that stale payload is
+		// the common case rather than the exception.
+		Release: client.SOLDeactivate(),
+		// The deactivate opens a session of its own, so a BMC that does not answer
+		// is known before the attach would wait out the same timeout again.
+		Unreachable: client.Unreachable,
+		// The session ends on "~.", which ssh would otherwise take for itself.
+		NoEscape: true,
+	}.Run(bench.runner, bench.progress)
 }
 
-func (bench *benchRack) Flash(target FlashTarget, fw string, force bool) error {
+// withFlashBus parks the bus, powers the board off so the RTE drives the flash,
+// energizes the selected branch, and runs fn with that flash on the SPI bus. It
+// always de-energizes the bus afterward, even when fn fails.
+//
+// A target marked acOff also has mains removed, and mains stays off once the
+// flash finishes: the bus returns to idle but the DUT does not come back on its
+// own, so bring it back with `power ac on`.
+func (bench *benchRack) withFlashBus(target FlashTarget, fn func(tgt targetCfg) error) error {
 	if bench.boardErr != nil {
 		return bench.boardErr
 	}
@@ -260,19 +459,31 @@ func (bench *benchRack) Flash(target FlashTarget, fw string, force bool) error {
 	if err != nil {
 		return err
 	}
+	// Removing mains is the only way to release a standby-powered chip, so a board
+	// without AC control cannot flash one. Report that before anything touches the
+	// bench.
+	if tgt.acOff && bench.tasmota == nil {
+		return fmt.Errorf("flashing the %s needs mains removed, but this board has no AC control", target)
+	}
 
-	// Park the load switches and the bus off before touching voltage or the
-	// mux, and export the E_GPA pins as outputs if this is the first run.
+	// Park the load switches and the bus off before touching voltage or the mux,
+	// calling parkOff rather than ensureIdle so a flash never trusts the state an
+	// earlier one left behind.
 	if err := bench.parkOff(); err != nil {
 		return err
 	}
 
-	info, err := os.Stat(fw)
-	if err != nil {
-		return err
-	}
-	if info.Size() != tgt.sizeBytes && !force {
-		return fmt.Errorf("%s is %d bytes, expected %d. Use --force to override", fw, info.Size(), tgt.sizeBytes)
+	// The BMC keeps running on standby power and driving its flash for as long as
+	// mains is applied, so soft power off is not enough to hand the chip to the
+	// RTE. Drop mains first, then wait for the rails to discharge: the BMC holds
+	// the bus for a moment after mains goes away, and energizing the branch while
+	// it still drives the chip fights it for the bus.
+	if tgt.acOff {
+		if err := bench.SetACPower(PowerOff); err != nil {
+			return err
+		}
+		fmt.Fprintf(bench.progress, "Waiting %s for the board to discharge...\n", bench.acDrainWait)
+		time.Sleep(bench.acDrainWait)
 	}
 
 	// The board is off, so the RTE powers the flash.
@@ -298,13 +509,16 @@ func (bench *benchRack) Flash(target FlashTarget, fw string, force bool) error {
 	if err := bench.gpio.Set(gpioMuxEnable, "low", 0); err != nil {
 		return err
 	}
+	// Bring up the SPI Vcc rail before closing the branch load switch, so the
+	// switch never ties a de-energized rail to a flash that another supply (the
+	// motherboard) may still hold at voltage and back-drive the rail.
+	if err := bench.gpio.Set(gpioSpiVcc, "low", 0); err != nil {
+		return err
+	}
 	if bench.board.powerSwitches {
 		if err := bench.gpio.Set(tgt.enable, "high", 0); err != nil {
 			return err
 		}
-	}
-	if err := bench.gpio.Set(gpioSpiVcc, "low", 0); err != nil {
-		return err
 	}
 	time.Sleep(bench.settle)
 	if err := bench.gpio.Set(gpioSpiLines, "low", 0); err != nil {
@@ -312,18 +526,57 @@ func (bench *benchRack) Flash(target FlashTarget, fw string, force bool) error {
 	}
 	time.Sleep(bench.settle)
 
-	remote, cleanup, err := bench.runner.Push(fw, remoteFirmware)
+	return fn(tgt)
+}
+
+func (bench *benchRack) FlashProbe(target FlashTarget) error {
+	return bench.withFlashBus(target, func(tgt targetCfg) error {
+		return bench.flashrom(flashProbe, tgt.chip, "")
+	})
+}
+
+func (bench *benchRack) FlashRead(target FlashTarget, outPath string) error {
+	return bench.withFlashBus(target, func(tgt targetCfg) error {
+		remote, fetch, err := bench.runner.Pull(outPath, remoteReadback)
+		if err != nil {
+			return err
+		}
+		if err := bench.flashrom(flashRead, tgt.chip, remote); err != nil {
+			return err
+		}
+		return fetch()
+	})
+}
+
+func (bench *benchRack) FlashWrite(target FlashTarget, fw string, force bool) error {
+	if bench.boardErr != nil {
+		return bench.boardErr
+	}
+	tgt, err := bench.target(target)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = cleanup() }()
-
-	return bench.flashrom(remote, tgt.chip)
+	info, err := os.Stat(fw)
+	if err != nil {
+		return err
+	}
+	if info.Size() != tgt.sizeBytes && !force {
+		return fmt.Errorf("%s is %d bytes, expected %d. Use --force to override", fw, info.Size(), tgt.sizeBytes)
+	}
+	return bench.withFlashBus(target, func(tgt targetCfg) error {
+		remote, cleanup, err := bench.runner.Push(fw, remoteFirmware)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = cleanup() }()
+		return bench.flashrom(flashWrite, tgt.chip, remote)
+	})
 }
 
 // parkOff drives the load-switch enables and the SPI bus to a known-off state.
 // It exports the E_GPA pins as outputs when they are still high-Z inputs from
-// boot, and turns off SPI Vcc or lines if a previous run left them on.
+// boot, and turns off SPI Vcc or lines if a previous run left them on. On success
+// it records the bench as idle, which is what lets ensureIdle skip a second park.
 func (bench *benchRack) parkOff() error {
 	for _, id := range []int{gpioEnBMC, gpioEnHost} {
 		pin, err := bench.gpio.Get(id)
@@ -347,32 +600,68 @@ func (bench *benchRack) parkOff() error {
 			}
 		}
 	}
+	// Point the mux select at the host branch, the idle default. Resting the
+	// select on the BMC branch freezes the BMC even with the mux disabled, so the
+	// select must never sit there while idle.
+	if err := bench.gpio.Set(gpioMuxSelect, bench.board.host.muxSelect, 0); err != nil {
+		return err
+	}
 	// Drive the mux enable high (active-low, so disabled) to isolate both flashes
 	// while idle, which is the default state whenever a flash is not in progress.
-	return bench.gpio.Set(gpioMuxEnable, "high", 0)
+	if err := bench.gpio.Set(gpioMuxEnable, "high", 0); err != nil {
+		return err
+	}
+	bench.idled = true
+	return nil
 }
 
 // deenergize returns the bus and switches to idle. It runs in a defer, so it is
 // best-effort: the flash result is what the caller reports.
 func (bench *benchRack) deenergize() {
 	_ = bench.gpio.Set(gpioSpiLines, "high-z", 0)
-	_ = bench.gpio.Set(gpioSpiVcc, "high-z", 0)
-	_ = bench.gpio.Set(gpioMuxEnable, "high", 0)
+	// Open the load switches before dropping the SPI Vcc rail, isolating the
+	// flash from the rail before it de-energizes so no external supply can drive
+	// current back into it.
 	_ = bench.gpio.Set(gpioEnBMC, "low", 0)
 	_ = bench.gpio.Set(gpioEnHost, "low", 0)
+	_ = bench.gpio.Set(gpioSpiVcc, "high-z", 0)
+	_ = bench.gpio.Set(gpioMuxEnable, "high", 0)
+	// Return the mux select to the host branch, the idle default, so a finished
+	// BMC flash never leaves the select resting on the BMC and freezing it.
+	_ = bench.gpio.Set(gpioMuxSelect, bench.board.host.muxSelect, 0)
 	_ = bench.gpio.Set(gpioSpiVoltage, "high-z", 0)
 }
 
-// flashrom runs the write over SSH, echoing output as it streams, and fails if
-// flashrom exits non-zero.
-func (bench *benchRack) flashrom(remote, chip string) error {
+// flashOp is a flashrom operation: probe (detect the chip only), read, or write.
+type flashOp int
+
+const (
+	flashProbe flashOp = iota
+	flashRead
+	flashWrite
+)
+
+// flashrom runs one flashrom operation over SSH, echoing output as it streams,
+// and fails if flashrom exits non-zero. file is the bench-side image path for a
+// read or a write, and is ignored for a probe.
+func (bench *benchRack) flashrom(op flashOp, chip, file string) error {
 	argv := []string{"flashrom", "-p", fmt.Sprintf("linux_spi:dev=%s,spispeed=%d", bench.spiDev, bench.spiSpeed)}
 	if chip != "" {
 		argv = append(argv, "-c", chip)
 	}
-	argv = append(argv, "-w", remote)
+	var start, done string
+	switch op {
+	case flashProbe:
+		start, done = "Probing flash...", "Probe complete."
+	case flashRead:
+		argv = append(argv, "-r", file)
+		start, done = "Reading flash...", "Read complete."
+	case flashWrite:
+		argv = append(argv, "-w", file)
+		start, done = "Flashing...", "Flash complete."
+	}
 
-	fmt.Fprintln(bench.progress, "Flashing...")
+	fmt.Fprintln(bench.progress, start)
 	stdout, wait, err := bench.runner.Stream(argv...)
 	if err != nil {
 		return err
@@ -387,7 +676,7 @@ func (bench *benchRack) flashrom(remote, chip string) error {
 	if err := wait(); err != nil {
 		return fmt.Errorf("flashrom failed: %w", err)
 	}
-	fmt.Fprintln(bench.progress, "Flash complete.")
+	fmt.Fprintln(bench.progress, done)
 	return nil
 }
 

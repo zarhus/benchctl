@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package exec runs bench commands, either locally (when the bench is the local
-// host) or over SSH from a workstation. It also copies firmware to the bench for
-// remote flashing.
+// host) or over SSH from a workstation. It also copies firmware to and from the
+// bench for remote flashing.
 package exec
 
 import (
@@ -25,6 +25,33 @@ type Target struct {
 func (target Target) IsLocal() bool {
 	return target.Host == "" || target.Host == "localhost"
 }
+
+// sshFailureStatus is the exit status ssh reserves for its own failures, such as
+// an unreachable host or a refused authentication. Any other status ssh returns
+// comes from the command that ran on the bench.
+const sshFailureStatus = 255
+
+// UnreachableError reports that a bench command never ran, because ssh could not
+// reach the bench. It is distinct from a command that ran and failed, so that a
+// caller names the bench rather than blaming the command, and can stop before
+// handing the terminal to a session that cannot open.
+//
+// A remote command that exits 255 itself is indistinguishable from ssh's own
+// failure and is reported this way too.
+type UnreachableError struct {
+	Host   string // the bench that could not be reached
+	Detail string // what ssh reported, empty when its output went to the terminal
+	Status error  // the exit error from the ssh invocation
+}
+
+func (unreachable *UnreachableError) Error() string {
+	if unreachable.Detail != "" {
+		return fmt.Sprintf("cannot reach bench %s: %s", unreachable.Host, unreachable.Detail)
+	}
+	return fmt.Sprintf("cannot reach bench %s: ssh failed (%v)", unreachable.Host, unreachable.Status)
+}
+
+func (unreachable *UnreachableError) Unwrap() error { return unreachable.Status }
 
 // remoteDeps are the external programs the SSH path shells out to: sshpass and
 // ssh on every command, scp when pushing firmware. A local target uses none of
@@ -83,13 +110,29 @@ func shellQuote(arg string) string {
 	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
+// ttyMode selects the terminal handling for a bench command run over SSH.
+type ttyMode int
+
+const (
+	// noTTY runs the command with no remote terminal.
+	noTTY ttyMode = iota
+	// remoteTTY allocates a remote pseudo-terminal, needed by a console that puts
+	// its stdout into raw mode, and leaves ssh's own "~" escape character in place.
+	remoteTTY
+	// remoteTTYNoEscape allocates a remote pseudo-terminal and disables ssh's
+	// escape character, so that "~" reaches the program on the bench.
+	remoteTTYNoEscape
+)
+
 // sshArgv builds the local argv that runs remote (a bench command) on the bench
-// over SSH. tty requests a remote pseudo-terminal (needed by the serial console,
-// which puts its stdout into raw mode).
-func sshArgv(target Target, remote []string, tty bool) []string {
+// over SSH, with terminal handling per mode.
+func sshArgv(target Target, remote []string, mode ttyMode) []string {
 	argv := []string{"sshpass", "-p", target.Password, "ssh"}
-	if tty {
+	if mode != noTTY {
 		argv = append(argv, "-tt")
+	}
+	if mode == remoteTTYNoEscape {
+		argv = append(argv, "-e", "none")
 	}
 	argv = append(argv, sshOpts...)
 	argv = append(argv, target.User+"@"+target.Host, shellJoin(remote))
@@ -101,5 +144,13 @@ func scpArgv(target Target, local, remotePath string) []string {
 	argv := []string{"sshpass", "-p", target.Password, "scp"}
 	argv = append(argv, sshOpts...)
 	argv = append(argv, local, target.User+"@"+target.Host+":"+remotePath)
+	return argv
+}
+
+// scpFromArgv builds the local argv that copies remotePath on the bench to local.
+func scpFromArgv(target Target, remotePath, local string) []string {
+	argv := []string{"sshpass", "-p", target.Password, "scp"}
+	argv = append(argv, sshOpts...)
+	argv = append(argv, target.User+"@"+target.Host+":"+remotePath, local)
 	return argv
 }

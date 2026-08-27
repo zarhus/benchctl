@@ -75,15 +75,29 @@ type Status struct {
 	ID    string
 }
 
+// BMC addresses a baseboard management controller over IPMI. The caller supplies
+// the address, so drivers hold no default for it.
+type BMC struct {
+	IP       string
+	User     string
+	Password string
+}
+
 // Platform is one bench's control surface. Drivers implement it over whatever
 // control mechanism the platform provides.
 type Platform interface {
 	PowerState() (PowerStatus, error)
-	SetPower(Power) error // polls until the requested state is reached
-	PowerReset() error    // power-reset the host, polls until it is back on
-	HardReset() error     // force a host reset through the platform's low-level path
-	Console() error       // attach to the host serial console, detach on exit
-	Flash(t FlashTarget, fw string, force bool) error
+	SetPower(Power) error                          // polls until the requested state is reached
+	PowerReset() error                             // power-reset the host, polls until it is back on
+	HardReset() error                              // force a host reset through the platform's low-level path
+	ACPowerState() (PowerStatus, error)            // whether mains/AC is applied, where the platform has AC control
+	SetACPower(Power) error                        // switch the mains/AC feed and confirm the new state
+	ACPowerCycle() error                           // AC power-cycle: mains off, brief wait, mains on
+	Console() error                                // attach to the host serial console, detach on exit
+	ConsoleSOL(BMC) error                          // attach to the host console over the BMC's IPMI serial-over-LAN payload
+	FlashProbe(t FlashTarget) error                // detect and report the flash chip
+	FlashRead(t FlashTarget, outPath string) error // read the flash into outPath
+	FlashWrite(t FlashTarget, fw string, force bool) error
 	FlashStatus(t FlashTarget) (Status, error)
 	FlashAbort(t FlashTarget) error
 }
@@ -91,7 +105,8 @@ type Platform interface {
 // Config carries resolved, driver-agnostic options into a driver constructor.
 // A driver uses only the fields that apply to it.
 type Config struct {
-	Board string // selected board; drivers that support several boards use it
+	Board     string // selected board; drivers that support several boards use it
+	TasmotaIP string // override for the AC-control Tasmota plug's address; empty uses the board default
 }
 
 // Spec describes a platform driver: its name, default SSH credentials, and a

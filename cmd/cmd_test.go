@@ -20,14 +20,36 @@ type fakePlatform struct {
 	flashErr  error
 	softReset bool
 	hardReset bool
+	acState   platform.PowerStatus
+	acErr     error
+	acSet     []platform.Power
+	acCycled  bool
+	console   bool
+	solBMC    *platform.BMC
 }
 
 func (fake *fakePlatform) PowerState() (platform.PowerStatus, error) { return fake.state, nil }
 func (fake *fakePlatform) SetPower(platform.Power) error             { return nil }
 func (fake *fakePlatform) PowerReset() error                         { fake.softReset = true; return nil }
 func (fake *fakePlatform) HardReset() error                          { fake.hardReset = true; return nil }
-func (fake *fakePlatform) Console() error                            { return nil }
-func (fake *fakePlatform) Flash(platform.FlashTarget, string, bool) error {
+func (fake *fakePlatform) ACPowerState() (platform.PowerStatus, error) {
+	return fake.acState, fake.acErr
+}
+func (fake *fakePlatform) SetACPower(p platform.Power) error {
+	fake.acSet = append(fake.acSet, p)
+	return fake.acErr
+}
+func (fake *fakePlatform) ACPowerCycle() error { fake.acCycled = true; return fake.acErr }
+func (fake *fakePlatform) Console() error      { fake.console = true; return nil }
+func (fake *fakePlatform) ConsoleSOL(bmc platform.BMC) error {
+	fake.solBMC = &bmc
+	return nil
+}
+func (fake *fakePlatform) FlashProbe(platform.FlashTarget) error { return fake.flashErr }
+func (fake *fakePlatform) FlashRead(platform.FlashTarget, string) error {
+	return fake.flashErr
+}
+func (fake *fakePlatform) FlashWrite(platform.FlashTarget, string, bool) error {
 	return fake.flashErr
 }
 func (fake *fakePlatform) FlashStatus(platform.FlashTarget) (platform.Status, error) {
@@ -78,11 +100,11 @@ func TestFlashStatusPrintsStateNotID(t *testing.T) {
 	}
 }
 
-func TestFlashBMCPropagatesNotImplemented(t *testing.T) {
+func TestFlashWriteBMCPropagatesNotImplemented(t *testing.T) {
 	withFakePlatform(t, &fakePlatform{flashErr: platform.ErrNotImplemented})
-	_, err := run(t, "flash", "bmc", "fw.bin")
+	_, err := run(t, "flash", "write", "bmc", "fw.bin")
 	if !errors.Is(err, platform.ErrNotImplemented) {
-		t.Errorf("flash bmc error = %v, want ErrNotImplemented", err)
+		t.Errorf("flash write bmc error = %v, want ErrNotImplemented", err)
 	}
 }
 
@@ -106,11 +128,163 @@ func TestPowerResetRoutesSoftVersusHard(t *testing.T) {
 	}
 }
 
+func TestPowerACStatusPrintsState(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{acState: platform.PowerStatus{Power: platform.PowerOn}})
+	out, err := run(t, "power", "ac", "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "on") {
+		t.Errorf("power ac status output = %q, want the AC state", out)
+	}
+}
+
+func TestPowerACOnOffRoute(t *testing.T) {
+	on := &fakePlatform{}
+	withFakePlatform(t, on)
+	if _, err := run(t, "power", "ac", "on"); err != nil {
+		t.Fatal(err)
+	}
+	if len(on.acSet) != 1 || on.acSet[0] != platform.PowerOn {
+		t.Errorf("power ac on set = %v, want [on]", on.acSet)
+	}
+
+	off := &fakePlatform{}
+	withFakePlatform(t, off)
+	if _, err := run(t, "power", "ac", "off"); err != nil {
+		t.Fatal(err)
+	}
+	if len(off.acSet) != 1 || off.acSet[0] != platform.PowerOff {
+		t.Errorf("power ac off set = %v, want [off]", off.acSet)
+	}
+}
+
+func TestPowerACCycleRoutes(t *testing.T) {
+	f := &fakePlatform{}
+	withFakePlatform(t, f)
+	if _, err := run(t, "power", "ac", "cycle"); err != nil {
+		t.Fatal(err)
+	}
+	if !f.acCycled {
+		t.Error("power ac cycle did not call ACPowerCycle")
+	}
+}
+
+func TestPowerACPropagatesNotImplemented(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{acErr: platform.ErrNotImplemented})
+	_, err := run(t, "power", "ac", "on")
+	if !errors.Is(err, platform.ErrNotImplemented) {
+		t.Errorf("power ac on error = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestTasmotaIPFlagScope(t *testing.T) {
+	// The flag belongs to the commands that reach the plug, power ac and the flash
+	// commands that drive the bus, rather than to the global set.
+	withFakePlatform(t, &fakePlatform{})
+	for _, args := range [][]string{
+		{"power", "ac", "status"},
+		{"flash", "probe", "bmc"},
+		{"flash", "read", "bmc", "dump.bin"},
+		{"flash", "write", "bmc", "fw.bin"},
+	} {
+		if _, err := run(t, append(args, "--tasmota-ip", "10.0.0.1")...); err != nil {
+			t.Errorf("%v --tasmota-ip should be accepted, got %v", args, err)
+		}
+	}
+	if _, err := run(t, "power", "on", "--tasmota-ip", "10.0.0.1"); err == nil {
+		t.Error("power on --tasmota-ip should be rejected as an unknown flag")
+	}
+}
+
+func TestFlashPassesTasmotaIP(t *testing.T) {
+	var got options
+	old := buildPlatform
+	buildPlatform = func(opts options) (platform.Platform, error) { got = opts; return &fakePlatform{}, nil }
+	t.Cleanup(func() { buildPlatform = old })
+
+	if _, err := run(t, "flash", "write", "bmc", "fw.bin", "--tasmota-ip", "10.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if got.tasmotaIP != "10.0.0.1" {
+		t.Errorf("flash write tasmotaIP = %q, want 10.0.0.1", got.tasmotaIP)
+	}
+
+	// Without the flag the driver falls back to the board's plug.
+	if _, err := run(t, "flash", "write", "bmc", "fw.bin"); err != nil {
+		t.Fatal(err)
+	}
+	if got.tasmotaIP != "" {
+		t.Errorf("flash write tasmotaIP = %q, want empty so the board default applies", got.tasmotaIP)
+	}
+}
+
+func TestConsoleDefaultsToSerial(t *testing.T) {
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "console"); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.console || fake.solBMC != nil {
+		t.Errorf("console = serial %v sol %v, want serial only", fake.console, fake.solBMC)
+	}
+}
+
+func TestConsoleSOLPassesBMCWithCredentialDefaults(t *testing.T) {
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "console", "--sol", "192.168.50.11"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.console {
+		t.Error("console --sol attached the serial console as well")
+	}
+	want := platform.BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}
+	if fake.solBMC == nil || *fake.solBMC != want {
+		t.Errorf("console --sol BMC = %+v, want %+v", fake.solBMC, want)
+	}
+}
+
+func TestConsoleSOLCredentialOverrides(t *testing.T) {
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	_, err := run(t, "console", "--sol", "10.1.2.3", "--bmc-user", "operator", "--bmc-password", "s3cret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := platform.BMC{IP: "10.1.2.3", User: "operator", Password: "s3cret"}
+	if fake.solBMC == nil || *fake.solBMC != want {
+		t.Errorf("console --sol BMC = %+v, want %+v", fake.solBMC, want)
+	}
+}
+
+func TestConsoleSOLNeedsAnAddress(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{})
+	if _, err := run(t, "console", "--sol"); err == nil {
+		t.Error("console --sol without an address should be rejected")
+	}
+}
+
+func TestConsoleBMCFlagsRequireSOL(t *testing.T) {
+	// Passing a BMC credential without --sol asks for the serial console with
+	// arguments that do not apply to it, which is a mistake worth reporting.
+	for _, flag := range []string{"--bmc-user", "--bmc-password"} {
+		fake := &fakePlatform{}
+		withFakePlatform(t, fake)
+		if _, err := run(t, "console", flag, "value"); err == nil {
+			t.Errorf("console %s without --sol should be rejected", flag)
+		}
+		if fake.console {
+			t.Errorf("console %s without --sol attached the serial console anyway", flag)
+		}
+	}
+}
+
 func TestCommandTreeWired(t *testing.T) {
 	root := newRootCmd()
 	want := map[string][]string{
-		"power": {"on", "off", "status", "reset"},
-		"flash": {"host", "bmc", "status", "abort"},
+		"power": {"on", "off", "status", "reset", "ac"},
+		"flash": {"probe", "read", "write", "status", "abort"},
 	}
 	for parent, subs := range want {
 		parentCmd, _, err := root.Find([]string{parent})

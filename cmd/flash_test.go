@@ -10,6 +10,35 @@ import (
 	"github.com/zarhus/benchctl/platform"
 )
 
+func TestFlashTargetFromName(t *testing.T) {
+	cases := []struct {
+		name    string
+		want    platform.FlashTarget
+		wantErr bool
+	}{
+		{"host", platform.FlashHost, false},
+		{"bmc", platform.FlashBMC, false},
+		{"", 0, true},
+		{"wat", 0, true},
+	}
+	for _, tc := range cases {
+		got, err := flashTargetFromName(tc.name)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("flashTargetFromName(%q) = nil error, want error", tc.name)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("flashTargetFromName(%q) error: %v", tc.name, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("flashTargetFromName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestParseFlashTarget(t *testing.T) {
 	cases := []struct {
 		args    []string
