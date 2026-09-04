@@ -384,6 +384,67 @@ func TestBenchRackConsoleSOLReportsActivateFailure(t *testing.T) {
 	}
 }
 
+func TestBenchRackConsoleUART1ReadsRawSerial(t *testing.T) {
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ConsoleUART1(); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.interactive) != 1 {
+		t.Fatalf("ConsoleUART1 interactive calls = %d, want 1", len(runner.interactive))
+	}
+	got := strings.Join(runner.interactive[0], " ")
+	for _, want := range []string{b.board.console.uart1Device, strconv.Itoa(b.board.console.uart1Baud), "stty", "cat"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("console argv = %q, want it to mention %q", got, want)
+		}
+	}
+}
+
+func TestBenchRackConsoleUART1IgnoresModemControlLines(t *testing.T) {
+	// Without clocal, opening a real UART blocks in open(2) until the line
+	// asserts carrier detect, which a debug header never does, so cat would hang
+	// with no output and no error rather than actually failing.
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ConsoleUART1(); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(runner.interactive[0], " ")
+	if !strings.Contains(got, "clocal") {
+		t.Errorf("console argv = %q, want it to set clocal so open() does not block on carrier detect", got)
+	}
+}
+
+func TestBenchRackConsoleUART1SuppressesKeystrokeEcho(t *testing.T) {
+	// cat never reads stdin, but the ssh session's own pty (distinct from the
+	// serial device) still echoes typed characters by default, so it needs its
+	// echo turned off too, not just the device's.
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ConsoleUART1(); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(runner.interactive[0], " ")
+	if !strings.Contains(got, "stty -echo") {
+		t.Errorf("console argv = %q, want it to disable echo on the controlling terminal", got)
+	}
+}
+
+func TestBenchRackConsoleUART1NotImplementedWithoutDevice(t *testing.T) {
+	// A board with no wired UART1 reports ErrNotImplemented without touching the
+	// bench, the same shape as an AC operation on a board with no Tasmota.
+	g := &fakeGPIO{}
+	b := testBenchRack(t, &fakeRunner{}, g)
+	b.board.console.uart1Device = ""
+	if err := b.ConsoleUART1(); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("ConsoleUART1 = %v, want ErrNotImplemented", err)
+	}
+	if len(g.sets) != 0 {
+		t.Errorf("ConsoleUART1 without a device set %v, want no GPIO writes", g.sets)
+	}
+}
+
 func TestBenchRackFlashHostSequence(t *testing.T) {
 	g := &fakeGPIO{pins: map[int]rte.Pin{
 		gpioEnBMC:  {Direction: "out", State: 0},
@@ -1014,6 +1075,7 @@ var powerCommands = []benchCommand{
 	{"ConsoleSOL", 1, func(b *benchRack) error {
 		return b.ConsoleSOL(BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"})
 	}},
+	{"ConsoleUART1", 1, func(b *benchRack) error { return b.ConsoleUART1() }},
 	{"ACPowerState", 1, func(b *benchRack) error { _, err := b.ACPowerState(); return err }},
 	{"SetACPower", 1, func(b *benchRack) error { return b.SetACPower(PowerOn) }},
 	{"ACPowerCycle", 1, func(b *benchRack) error { return b.ACPowerCycle() }},

@@ -42,8 +42,9 @@ bin/benchctl power ac on                              apply mains/AC power (Tasm
 bin/benchctl power ac off                             remove mains/AC power
 bin/benchctl power ac cycle                           AC power-cycle: mains off, brief wait, mains on
 bin/benchctl power ac status                          print whether mains/AC is applied
-bin/benchctl console                                  attach to the host serial console
-bin/benchctl console --sol <bmc-ip>                   attach to the host console via BMC SOL
+bin/benchctl console                                  attach to the host serial console (COM1)
+bin/benchctl console --source sol --bmc-ip <ip>       attach to the host console via BMC SOL
+bin/benchctl console --source uart1                   attach read-only to the UART1 debug console
 bin/benchctl flash probe <host|bmc>                   detect and print the flash chip
 bin/benchctl flash read  <host|bmc> <file>            read the flash into <file>
 bin/benchctl flash write <host|bmc> <fw> [--force]    write firmware to the flash
@@ -132,16 +133,19 @@ error rather than a long wait.
 
 ### Consoles
 
-`benchctl console` attaches to the motherboard's COM1 port, which the RTE
-exports over telnet with ser2net. That port carries host output only while the
-BMC leaves it to the host. An OpenBMC configured to print its own logs there
-takes the port over, and the host console then has to come from the BMC instead.
+`--source` selects where `benchctl console` attaches: `com1` (the default),
+`sol`, or `uart1`.
 
-`benchctl console --sol <bmc-ip>` reaches it that way, over the BMC's IPMI
+`--source com1` attaches to the motherboard's COM1 port, which the RTE exports
+over telnet with ser2net. That port carries host output only while the BMC
+leaves it to the host. An OpenBMC configured to print its own logs there takes
+the port over, and the host console then has to come from the BMC instead.
+
+`--source sol --bmc-ip <ip>` reaches it that way, over the BMC's IPMI
 serial-over-LAN payload:
 
 ```sh
-bin/benchctl --host rte.local console --sol 192.168.50.11
+bin/benchctl --host rte.local console --source sol --bmc-ip 192.168.50.11
 ```
 
 The credentials default to `admin` and `Administrator`, overridden with
@@ -163,6 +167,14 @@ disables ssh's own escape character, so that `~.` reaches ipmitool instead of
 dropping the SSH connection and stranding the payload. The cost is that `~.`
 cannot rescue the SSH session itself while SOL is attached.
 
+`--source uart1` attaches read-only to a second debug UART some boards wire to
+the RTE separately from COM1, typically host firmware output running alongside
+the BMC's own console on COM1. There is nothing to type into it, so the attach
+is a plain `stty`-configured `cat` of the device rather than an interactive
+program, and detach is a plain Ctrl+C rather than an escape sequence. Boards
+without a wired UART1 report the command as not implemented. `--bmc-ip`,
+`--bmc-user`, and `--bmc-password` apply only with `--source sol`.
+
 ## Platforms
 
 | Platform    | Status      | SSH user / default password |
@@ -171,10 +183,10 @@ cannot rescue the SSH session itself while SOL is attached.
 
 BenchRack flashes the host and BMC flashes through the SPI mux, controls host
 power through the RTE, switches the mains feed through a Tasmota plug, and
-reaches the host console either over the RTE's ser2net port or over the BMC's
-IPMI serial-over-LAN. `flash status` and `flash abort` report "not implemented",
-because `flashrom` runs to completion within one command and leaves no update
-state to query or abort.
+reaches the host console over the RTE's ser2net port, the BMC's IPMI
+serial-over-LAN, or a read-only UART1 debug line. `flash status` and
+`flash abort` report "not implemented", because `flashrom` runs to completion
+within one command and leaves no update state to query or abort.
 
 Adding another platform is one package that implements the `Platform` interface
 and registers itself with `platform.Register()` from its `init()`. Drivers can
@@ -185,7 +197,8 @@ that imports this one and builds its own `main`.
 
 - On the PC: `ssh`, `scp`, `sshpass`.
 - On a BenchRack RTE: `flashrom`, `telnet`, `curl` (for `power ac`), `ipmitool`
-  (for `console --sol`), and the RteCtrl REST API (port 8000).
+  (for `console --source sol`), `stty` and `cat` (for `console --source uart1`),
+  and the RteCtrl REST API (port 8000).
 
 ## Development
 

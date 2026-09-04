@@ -26,6 +26,7 @@ type fakePlatform struct {
 	acCycled  bool
 	console   bool
 	solBMC    *platform.BMC
+	uart1     bool
 }
 
 func (fake *fakePlatform) PowerState() (platform.PowerStatus, error) { return fake.state, nil }
@@ -45,6 +46,7 @@ func (fake *fakePlatform) ConsoleSOL(bmc platform.BMC) error {
 	fake.solBMC = &bmc
 	return nil
 }
+func (fake *fakePlatform) ConsoleUART1() error                   { fake.uart1 = true; return nil }
 func (fake *fakePlatform) FlashProbe(platform.FlashTarget) error { return fake.flashErr }
 func (fake *fakePlatform) FlashRead(platform.FlashTarget, string) error {
 	return fake.flashErr
@@ -219,64 +221,82 @@ func TestFlashPassesTasmotaIP(t *testing.T) {
 	}
 }
 
-func TestConsoleDefaultsToSerial(t *testing.T) {
+func TestConsoleDefaultsToCOM1(t *testing.T) {
 	fake := &fakePlatform{}
 	withFakePlatform(t, fake)
 	if _, err := run(t, "console"); err != nil {
 		t.Fatal(err)
 	}
-	if !fake.console || fake.solBMC != nil {
-		t.Errorf("console = serial %v sol %v, want serial only", fake.console, fake.solBMC)
+	if !fake.console || fake.solBMC != nil || fake.uart1 {
+		t.Errorf("console = serial %v sol %v uart1 %v, want serial only", fake.console, fake.solBMC, fake.uart1)
 	}
 }
 
-func TestConsoleSOLPassesBMCWithCredentialDefaults(t *testing.T) {
+func TestConsoleSourceSOLPassesBMCWithCredentialDefaults(t *testing.T) {
 	fake := &fakePlatform{}
 	withFakePlatform(t, fake)
-	if _, err := run(t, "console", "--sol", "192.168.50.11"); err != nil {
+	if _, err := run(t, "console", "--source", "sol", "--bmc-ip", "192.168.50.11"); err != nil {
 		t.Fatal(err)
 	}
-	if fake.console {
-		t.Error("console --sol attached the serial console as well")
+	if fake.console || fake.uart1 {
+		t.Errorf("console --source sol also attached serial %v uart1 %v", fake.console, fake.uart1)
 	}
 	want := platform.BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}
 	if fake.solBMC == nil || *fake.solBMC != want {
-		t.Errorf("console --sol BMC = %+v, want %+v", fake.solBMC, want)
+		t.Errorf("console --source sol BMC = %+v, want %+v", fake.solBMC, want)
 	}
 }
 
-func TestConsoleSOLCredentialOverrides(t *testing.T) {
+func TestConsoleSourceSOLCredentialOverrides(t *testing.T) {
 	fake := &fakePlatform{}
 	withFakePlatform(t, fake)
-	_, err := run(t, "console", "--sol", "10.1.2.3", "--bmc-user", "operator", "--bmc-password", "s3cret")
+	_, err := run(t, "console", "--source", "sol", "--bmc-ip", "10.1.2.3", "--bmc-user", "operator", "--bmc-password", "s3cret")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := platform.BMC{IP: "10.1.2.3", User: "operator", Password: "s3cret"}
 	if fake.solBMC == nil || *fake.solBMC != want {
-		t.Errorf("console --sol BMC = %+v, want %+v", fake.solBMC, want)
+		t.Errorf("console --source sol BMC = %+v, want %+v", fake.solBMC, want)
 	}
 }
 
-func TestConsoleSOLNeedsAnAddress(t *testing.T) {
+func TestConsoleSourceSOLNeedsABMCIP(t *testing.T) {
 	withFakePlatform(t, &fakePlatform{})
-	if _, err := run(t, "console", "--sol"); err == nil {
-		t.Error("console --sol without an address should be rejected")
+	if _, err := run(t, "console", "--source", "sol"); err == nil {
+		t.Error("console --source sol without --bmc-ip should be rejected")
 	}
 }
 
-func TestConsoleBMCFlagsRequireSOL(t *testing.T) {
-	// Passing a BMC credential without --sol asks for the serial console with
-	// arguments that do not apply to it, which is a mistake worth reporting.
-	for _, flag := range []string{"--bmc-user", "--bmc-password"} {
+func TestConsoleBMCFlagsRequireSourceSOL(t *testing.T) {
+	// Passing a BMC flag with the default (or uart1) source asks for a console
+	// with arguments that do not apply to it, which is a mistake worth reporting.
+	for _, flag := range []string{"--bmc-ip", "--bmc-user", "--bmc-password"} {
 		fake := &fakePlatform{}
 		withFakePlatform(t, fake)
 		if _, err := run(t, "console", flag, "value"); err == nil {
-			t.Errorf("console %s without --sol should be rejected", flag)
+			t.Errorf("console %s without --source sol should be rejected", flag)
 		}
 		if fake.console {
-			t.Errorf("console %s without --sol attached the serial console anyway", flag)
+			t.Errorf("console %s without --source sol attached the serial console anyway", flag)
 		}
+	}
+}
+
+func TestConsoleSourceUART1Routes(t *testing.T) {
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "console", "--source", "uart1"); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.uart1 || fake.console || fake.solBMC != nil {
+		t.Errorf("console --source uart1 = serial %v sol %v uart1 %v, want uart1 only", fake.console, fake.solBMC, fake.uart1)
+	}
+}
+
+func TestConsoleSourceRejectsUnknownValue(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{})
+	if _, err := run(t, "console", "--source", "bogus"); err == nil {
+		t.Error("console --source bogus should be rejected")
 	}
 }
 

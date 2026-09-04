@@ -66,9 +66,13 @@ type targetCfg struct {
 }
 
 // consoleCfg is where the DUT serial console is reached. The RTE runs ser2net,
-// which exports the console over telnet on a TCP port.
+// which exports the COM1 console over telnet on a TCP port. UART1, when a board
+// has one wired to the RTE, is a separate read-only debug line reached directly
+// through its device node; uart1Device empty means the board has none.
 type consoleCfg struct {
-	port int
+	port        int
+	uart1Device string
+	uart1Baud   int
 }
 
 // board is the per-board configuration.
@@ -104,8 +108,9 @@ var boards = map[string]board{
 		bmc:           targetCfg{chip: "", voltage: "3.3V", sizeBytes: 64 * 1024 * 1024, muxSelect: "high", enable: gpioEnBMC, acOff: true},
 		powerSwitches: true,
 		// TODO(bring-up): confirm the mux-select polarity against the hardware.
-		// ser2net.yaml maps /dev/ttyS1 (115200n81) to telnet port 13541.
-		console:   consoleCfg{port: 13541},
+		// ser2net.yaml maps /dev/ttyS1 (115200n81) to telnet port 13541. UART1 is a
+		// USB-serial adapter plugged directly into the RTE, also 115200n81.
+		console:   consoleCfg{port: 13541, uart1Device: "/dev/ttyUSB0", uart1Baud: 115200},
 		tasmotaIP: defaultTasmotaIP,
 	},
 }
@@ -441,6 +446,44 @@ func (bench *benchRack) ConsoleSOL(bmc BMC) error {
 		Unreachable: client.Unreachable,
 		// The session ends on "~.", which ssh would otherwise take for itself.
 		NoEscape: true,
+	}.Run(bench.runner, bench.progress)
+}
+
+// ConsoleUART1 attaches, read-only, to a second debug UART some boards wire to
+// the RTE separately from COM1 - typically host firmware output that runs
+// alongside the BMC's own console on COM1 rather than sharing it.
+func (bench *benchRack) ConsoleUART1() error {
+	if bench.boardErr != nil {
+		return bench.boardErr
+	}
+	// Reject a board with nothing wired before parking, so a call the driver
+	// cannot act on leaves the bench untouched.
+	if bench.board.console.uart1Device == "" {
+		return ErrNotImplemented
+	}
+	if err := bench.ensureIdle(); err != nil {
+		return err
+	}
+	device := bench.board.console.uart1Device
+	baud := strconv.Itoa(bench.board.console.uart1Baud)
+	// The line starts in canonical mode, which would mangle control bytes in the
+	// firmware's own escape sequences (e.g. a screen clear), so it is set raw
+	// before cat reads it. clocal tells the driver to ignore modem control
+	// lines: without it, opening a real UART blocks in open(2) until the line
+	// asserts carrier detect, which a debug header never does, so cat would sit
+	// with no output and no error rather than actually failing. There is no
+	// attach program to release on exit, so Ctrl+C is a real SIGINT rather than
+	// a protocol-level detach: the trap turns that into a clean exit instead of
+	// a spurious failure. The leading stty (with no -F, so it targets the ssh
+	// session's own pty rather than the serial device) stops that pty's own
+	// line discipline from echoing typed characters back: cat never reads
+	// stdin, but the session pty still echoes by default regardless of who
+	// reads it.
+	script := fmt.Sprintf(`stty -echo; trap "exit 0" INT; stty -F %s %s cs8 -cstopb -parenb clocal raw -echo && cat %s`, device, baud, device)
+	return ConsoleSession{
+		What:   "UART1 firmware console (read-only) on " + device,
+		Detach: "Ctrl+C",
+		Attach: []string{"sh", "-c", script},
 	}.Run(bench.runner, bench.progress)
 }
 

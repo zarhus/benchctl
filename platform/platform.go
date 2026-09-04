@@ -95,6 +95,7 @@ type Platform interface {
 	ACPowerCycle() error                           // AC power-cycle: mains off, brief wait, mains on
 	Console() error                                // attach to the host serial console, detach on exit
 	ConsoleSOL(BMC) error                          // attach to the host console over the BMC's IPMI serial-over-LAN payload
+	ConsoleUART1() error                           // read-only attach to the host firmware's UART1 debug output
 	FlashProbe(t FlashTarget) error                // detect and report the flash chip
 	FlashRead(t FlashTarget, outPath string) error // read the flash into outPath
 	FlashWrite(t FlashTarget, fw string, force bool) error
