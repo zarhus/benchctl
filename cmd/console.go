@@ -46,10 +46,11 @@ func consoleCmd() *cobra.Command {
 			case "com1":
 				return withPlatform(func(p platform.Platform) error { return p.Console() })
 			case "sol":
-				if bmcIP == "" {
-					return fmt.Errorf("--source sol needs --bmc-ip")
+				ip := resolveBMCIP(bmcIP)
+				if ip == "" {
+					return fmt.Errorf("--source sol needs --bmc-ip or BENCHCTL_BMC_IP")
 				}
-				bmc := platform.BMC{IP: bmcIP, User: bmcUser, Password: bmcPassword}
+				bmc := platform.BMC{IP: ip, User: bmcUser, Password: bmcPassword}
 				return withPlatform(func(p platform.Platform) error { return p.ConsoleSOL(bmc) })
 			case "uart1":
 				return withPlatform(func(p platform.Platform) error { return p.ConsoleUART1() })
@@ -61,7 +62,7 @@ func consoleCmd() *cobra.Command {
 
 	flags := console.Flags()
 	flags.StringVar(&source, "source", "com1", "console to attach to: `com1`, sol, or uart1")
-	flags.StringVar(&bmcIP, "bmc-ip", "", "BMC `address` for --source sol")
+	flags.StringVar(&bmcIP, "bmc-ip", "", "BMC `address` for --source sol (or BENCHCTL_BMC_IP)")
 	flags.StringVar(&bmcUser, "bmc-user", "admin", "BMC IPMI user (with --source sol)")
 	flags.StringVar(&bmcPassword, "bmc-password", "Administrator", "BMC IPMI password (with --source sol)")
 	return console

@@ -65,6 +65,15 @@ func resolveTasmotaIP(flagVal string) string {
 	return os.Getenv("BENCHCTL_TASMOTA_IP")
 }
 
+// resolveBMCIP returns the BMC address for --source sol from the flag, then
+// BENCHCTL_BMC_IP, then empty so the caller reports it as missing.
+func resolveBMCIP(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv("BENCHCTL_BMC_IP")
+}
+
 // resolvePassword returns the SSH password from the flag, then
 // BENCHCTL_PASSWORD, then the driver's default.
 func resolvePassword(flagVal, driverDefault string) string {

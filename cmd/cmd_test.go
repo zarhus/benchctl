@@ -261,9 +261,35 @@ func TestConsoleSourceSOLCredentialOverrides(t *testing.T) {
 }
 
 func TestConsoleSourceSOLNeedsABMCIP(t *testing.T) {
+	t.Setenv("BENCHCTL_BMC_IP", "")
 	withFakePlatform(t, &fakePlatform{})
 	if _, err := run(t, "console", "--source", "sol"); err == nil {
 		t.Error("console --source sol without --bmc-ip should be rejected")
+	}
+}
+
+func TestConsoleSourceSOLUsesBMCIPEnvVar(t *testing.T) {
+	t.Setenv("BENCHCTL_BMC_IP", "192.168.50.11")
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "console", "--source", "sol"); err != nil {
+		t.Fatal(err)
+	}
+	want := platform.BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}
+	if fake.solBMC == nil || *fake.solBMC != want {
+		t.Errorf("console --source sol BMC = %+v, want %+v", fake.solBMC, want)
+	}
+}
+
+func TestConsoleSourceSOLBMCIPFlagWinsOverEnvVar(t *testing.T) {
+	t.Setenv("BENCHCTL_BMC_IP", "10.0.0.9")
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "console", "--source", "sol", "--bmc-ip", "192.168.50.11"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.solBMC == nil || fake.solBMC.IP != "192.168.50.11" {
+		t.Errorf("console --source sol BMC = %+v, want the flag's address", fake.solBMC)
 	}
 }
 

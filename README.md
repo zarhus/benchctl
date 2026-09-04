@@ -148,8 +148,9 @@ serial-over-LAN payload:
 bin/benchctl --host rte.local console --source sol --bmc-ip 192.168.50.11
 ```
 
-The credentials default to `admin` and `Administrator`, overridden with
-`--bmc-user` and `--bmc-password`.
+`--bmc-ip` falls back to `BENCHCTL_BMC_IP` when not given, the same pattern as
+`--host`. The credentials default to `admin` and `Administrator`, overridden
+with `--bmc-user` and `--bmc-password`.
 
 Detach with `~.` at the start of a line. Every attach runs `sol deactivate`
 first, and again on the way out, because a session that ended any other way,

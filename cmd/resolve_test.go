@@ -103,6 +103,27 @@ func TestResolveBoardEmptyWhenUnset(t *testing.T) {
 	}
 }
 
+func TestResolveBMCIPFlagWins(t *testing.T) {
+	t.Setenv("BENCHCTL_BMC_IP", "from-env")
+	if got := resolveBMCIP("from-flag"); got != "from-flag" {
+		t.Errorf("resolveBMCIP = %q, want from-flag", got)
+	}
+}
+
+func TestResolveBMCIPEnvFallback(t *testing.T) {
+	t.Setenv("BENCHCTL_BMC_IP", "192.168.50.11")
+	if got := resolveBMCIP(""); got != "192.168.50.11" {
+		t.Errorf("resolveBMCIP = %q, want 192.168.50.11", got)
+	}
+}
+
+func TestResolveBMCIPEmptyWhenUnset(t *testing.T) {
+	t.Setenv("BENCHCTL_BMC_IP", "")
+	if got := resolveBMCIP(""); got != "" {
+		t.Errorf("resolveBMCIP = %q, want empty when neither flag nor env is set", got)
+	}
+}
+
 func TestBuildUnknownPlatformErrors(t *testing.T) {
 	_, err := build(options{host: "bench.local", platform: "no-such"})
 	if err == nil || !strings.Contains(err.Error(), "no-such") {
