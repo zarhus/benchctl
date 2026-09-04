@@ -19,6 +19,11 @@ tasks:
     cmds:
       - go build -o bin/benchctl .
 
+  install:
+    desc: Install the benchctl binary onto GOPATH/bin
+    cmds:
+      - go install .
+
   test:
     desc: Run all tests
     cmds:
