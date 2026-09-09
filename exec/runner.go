@@ -42,6 +42,14 @@ type Runner interface {
 	// SOL payload open on the BMC. Running locally there is no ssh in the way and
 	// this is identical to RunInteractive.
 	RunInteractiveNoEscape(argv ...string) error
+	// RunInteractiveOut is RunInteractive but writes the process's own standard
+	// output and standard error to out instead of straight to the local
+	// terminal; standard input still goes to the local terminal directly, so
+	// real interactivity (typing into the session) is unaffected. Used by a
+	// caller that retries a flaky attach and wants to withhold a fast-failing
+	// attempt's own output until it is known worth showing, without losing
+	// live output once a session actually holds.
+	RunInteractiveOut(out io.Writer, argv ...string) error
 	// Stream runs argv on the bench and returns a reader of its standard output
 	// plus a wait function. The caller reads stdout to EOF, then calls wait,
 	// which returns the command's exit error (including stderr) or nil. Used for
@@ -124,20 +132,66 @@ func (runner *CmdRunner) Run(argv ...string) (string, error) {
 }
 
 func (runner *CmdRunner) RunInteractive(argv ...string) error {
-	return runner.runInteractive(argv, remoteTTY)
+	return runner.runInteractive(argv, remoteTTY, os.Stdout, os.Stderr)
 }
 
 func (runner *CmdRunner) RunInteractiveNoEscape(argv ...string) error {
-	return runner.runInteractive(argv, remoteTTYNoEscape)
+	return runner.runInteractive(argv, remoteTTYNoEscape, os.Stdout, os.Stderr)
 }
 
-func (runner *CmdRunner) runInteractive(argv []string, mode ttyMode) error {
+// RunInteractiveOut uses a single real pipe for both standard output and
+// standard error, rather than the two independent io.Writer-backed pipes
+// Go's os/exec would otherwise set up (one copying goroutine each). Two
+// separate pipes let an unsynchronized stdout-copying goroutine and
+// stderr-copying goroutine race: confirmed live (via a console session
+// retrying a flaky telnet attach through this method) to reorder and garble
+// output - the process's own stderr diagnosis landing ahead of an earlier
+// stdout line, run together without a line break between them. Sharing one
+// pipe end for both streams means the process's own write(2) calls, to
+// either fd, land in the exact order it issued them, the same as a real
+// terminal would serialize them.
+func (runner *CmdRunner) RunInteractiveOut(out io.Writer, argv ...string) error {
+	full := runner.commandArgv(argv, remoteTTY)
+	runner.trace(full)
+	cmd := exec.Command(full[0], full[1:]...)
+	cmd.Stdin = os.Stdin
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("%s: %w", shellJoin(argv), err)
+	}
+	cmd.Stdout = w
+	cmd.Stderr = w
+
+	copyDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(out, r)
+		close(copyDone)
+	}()
+
+	runErr := cmd.Run()
+	w.Close()
+	<-copyDone
+	r.Close()
+
+	if runErr == nil {
+		return nil
+	}
+	// ssh wrote its own diagnosis into out, so there is nothing to carry in
+	// Detail.
+	if unreachable := runner.unreachable(runErr, ""); unreachable != nil {
+		return unreachable
+	}
+	return runErr
+}
+
+func (runner *CmdRunner) runInteractive(argv []string, mode ttyMode, stdout, stderr io.Writer) error {
 	full := runner.commandArgv(argv, mode)
 	runner.trace(full)
 	cmd := exec.Command(full[0], full[1:]...)
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	err := cmd.Run()
 	if err == nil {
 		return nil

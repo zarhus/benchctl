@@ -27,6 +27,9 @@ type fakePlatform struct {
 	console   bool
 	solBMC    *platform.BMC
 	uart1     bool
+	diskErr   error
+	mounted   []string // "<image> <medium>" per DiskMount call, in order
+	ejected   bool
 }
 
 func (fake *fakePlatform) PowerState() (platform.PowerStatus, error) { return fake.state, nil }
@@ -58,6 +61,13 @@ func (fake *fakePlatform) FlashStatus(platform.FlashTarget) (platform.Status, er
 	return fake.status, nil
 }
 func (fake *fakePlatform) FlashAbort(platform.FlashTarget) error { return nil }
+
+func (fake *fakePlatform) DiskMount(image string, medium platform.DiskMedium) error {
+	fake.mounted = append(fake.mounted, image+" "+medium.String())
+	return fake.diskErr
+}
+func (fake *fakePlatform) DiskEject() error  { fake.ejected = true; return fake.diskErr }
+func (fake *fakePlatform) DiskStatus() error { return fake.diskErr }
 
 func withFakePlatform(t *testing.T, driver platform.Platform) {
 	t.Helper()
@@ -107,6 +117,54 @@ func TestFlashWriteBMCPropagatesNotImplemented(t *testing.T) {
 	_, err := run(t, "flash", "write", "bmc", "fw.bin")
 	if !errors.Is(err, platform.ErrNotImplemented) {
 		t.Errorf("flash write bmc error = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestDiskMountDefaultsToVirtio(t *testing.T) {
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "disk", "mount", "ubuntu.iso"); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"ubuntu.iso virtio"}; len(fake.mounted) != 1 || fake.mounted[0] != want[0] {
+		t.Errorf("disk mount calls = %v, want %v", fake.mounted, want)
+	}
+}
+
+func TestDiskMountMediumFlag(t *testing.T) {
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "disk", "mount", "ubuntu.iso", "--medium", "ahci"); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"ubuntu.iso ahci"}; len(fake.mounted) != 1 || fake.mounted[0] != want[0] {
+		t.Errorf("disk mount calls = %v, want %v", fake.mounted, want)
+	}
+}
+
+func TestDiskMountRejectsUnknownMedium(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{})
+	if _, err := run(t, "disk", "mount", "ubuntu.iso", "--medium", "usb"); err == nil {
+		t.Error("disk mount --medium usb: want an error, got nil")
+	}
+}
+
+func TestDiskEject(t *testing.T) {
+	fake := &fakePlatform{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "disk", "eject"); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.ejected {
+		t.Error("disk eject: DiskEject was not called")
+	}
+}
+
+func TestDiskMountPropagatesNotImplemented(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{diskErr: platform.ErrNotImplemented})
+	_, err := run(t, "disk", "mount", "ubuntu.iso")
+	if !errors.Is(err, platform.ErrNotImplemented) {
+		t.Errorf("disk mount error = %v, want ErrNotImplemented", err)
 	}
 }
 

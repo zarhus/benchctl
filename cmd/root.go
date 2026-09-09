@@ -51,7 +51,7 @@ func newRootCmd() *cobra.Command {
 	flags.BoolVarP(&flagVerbose, "verbose", "v", false, "trace bench commands")
 	_ = flags.MarkHidden("platform")
 
-	root.AddCommand(powerCmd(), consoleCmd(), flashCmd())
+	root.AddCommand(powerCmd(), consoleCmd(), flashCmd(), diskCmd())
 	return root
 }
 

@@ -23,6 +23,11 @@ type fakeRunner struct {
 	streamErr      error  // result of the Stream wait function
 	host           string // reported by Host()
 	interactiveErr error
+	interactiveOut string // canned output written to RunInteractiveOut's out
+	// interactiveOutHandler, when set, scripts RunInteractiveOut per call
+	// instead of the fixed interactiveOut/interactiveErr above - for tests
+	// that need a sequence of outcomes (e.g. Console's retry loop).
+	interactiveOutHandler func(call int, out io.Writer, argv []string) error
 }
 
 func (fake *fakeRunner) Host() string { return fake.host }
@@ -48,6 +53,20 @@ func (fake *fakeRunner) RunInteractiveNoEscape(argv ...string) error {
 	fake.interactive = append(fake.interactive, argv)
 	fake.sequence = append(fake.sequence, argv)
 	fake.noEscape = append(fake.noEscape, true)
+	return fake.interactiveErr
+}
+
+func (fake *fakeRunner) RunInteractiveOut(out io.Writer, argv ...string) error {
+	callIndex := len(fake.interactive)
+	fake.interactive = append(fake.interactive, argv)
+	fake.sequence = append(fake.sequence, argv)
+	fake.noEscape = append(fake.noEscape, false)
+	if fake.interactiveOutHandler != nil {
+		return fake.interactiveOutHandler(callIndex, out, argv)
+	}
+	if fake.interactiveOut != "" {
+		_, _ = io.WriteString(out, fake.interactiveOut)
+	}
 	return fake.interactiveErr
 }
 

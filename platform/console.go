@@ -37,8 +37,17 @@ type ConsoleSession struct {
 	// which is the ordinary state around a session.
 	Release []string
 	// NoEscape disables the SSH client's own escape character for the attach,
-	// for a program that takes "~" as its own.
+	// for a program that takes "~" as its own. Ignored when Out is set (the
+	// two are not needed together by any current caller).
 	NoEscape bool
+	// Out, when set, routes the announcement and the attach's own standard
+	// output/error through it instead of straight to the terminal, while
+	// standard input still goes to the terminal directly - real interactivity
+	// is unaffected. A caller retrying a flaky attach passes a buffering
+	// writer here to withhold a fast-failing attempt's own output until it is
+	// known worth showing - see consoleSpamGuard in fvp.go for the
+	// motivating use.
+	Out io.Writer
 	// Unreachable, when set, reads a failed Release and reports whether the
 	// console cannot be reached at all, in which case Run stops instead of
 	// attaching. The release reaches the same place the attach does, so its
@@ -70,12 +79,22 @@ func (session ConsoleSession) Run(runner exec.Runner, progress io.Writer) error 
 		}
 		defer func() { _, _ = runner.Run(session.Release...) }()
 	}
-	fmt.Fprintf(progress, "Attaching to %s. Detach with %s.\n", session.What, session.Detach)
-	attach := runner.RunInteractive
-	if session.NoEscape {
-		attach = runner.RunInteractiveNoEscape
+	out := progress
+	if session.Out != nil {
+		out = session.Out
 	}
-	if err := attach(session.Attach...); err != nil {
+	fmt.Fprintf(out, "Attaching to %s. Detach with %s.\n", session.What, session.Detach)
+	var err error
+	if session.Out != nil {
+		err = runner.RunInteractiveOut(session.Out, session.Attach...)
+	} else {
+		attach := runner.RunInteractive
+		if session.NoEscape {
+			attach = runner.RunInteractiveNoEscape
+		}
+		err = attach(session.Attach...)
+	}
+	if err != nil {
 		// An unreachable bench is not the console's failure, so naming the console
 		// would point at the wrong host.
 		if benchUnreachable(err) {

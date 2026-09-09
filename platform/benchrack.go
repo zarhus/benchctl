@@ -730,3 +730,18 @@ func (bench *benchRack) FlashStatus(FlashTarget) (Status, error) {
 func (bench *benchRack) FlashAbort(FlashTarget) error {
 	return ErrNotImplemented
 }
+
+// This board has no media-mount control (no virtual CD/USB path), the same
+// way it has no AC control on boards with no Tasmota plug - so, like
+// ACPowerState and friends, these just report ErrNotImplemented.
+func (bench *benchRack) DiskMount(image string, medium DiskMedium) error {
+	return ErrNotImplemented
+}
+
+func (bench *benchRack) DiskEject() error {
+	return ErrNotImplemented
+}
+
+func (bench *benchRack) DiskStatus() error {
+	return ErrNotImplemented
+}

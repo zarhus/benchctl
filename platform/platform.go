@@ -75,6 +75,39 @@ type Status struct {
 	ID    string
 }
 
+// DiskMedium selects how a mounted disk image is presented to the host -
+// meaningful mainly to a platform (like fvp) that can model more than one
+// attachment point; a platform with a single fixed one is free to ignore it.
+type DiskMedium int
+
+const (
+	DiskAHCI   DiskMedium = iota // SATA/AHCI, e.g. an installer ISO or disk image
+	DiskVirtio                   // virtio-blk
+)
+
+func (medium DiskMedium) String() string {
+	switch medium {
+	case DiskAHCI:
+		return "ahci"
+	case DiskVirtio:
+		return "virtio"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseDiskMedium maps a CLI-facing name to a DiskMedium.
+func ParseDiskMedium(name string) (DiskMedium, error) {
+	switch name {
+	case "ahci":
+		return DiskAHCI, nil
+	case "virtio":
+		return DiskVirtio, nil
+	default:
+		return 0, fmt.Errorf("unknown disk medium %q (want ahci or virtio)", name)
+	}
+}
+
 // BMC addresses a baseboard management controller over IPMI. The caller supplies
 // the address, so drivers hold no default for it.
 type BMC struct {
@@ -101,6 +134,9 @@ type Platform interface {
 	FlashWrite(t FlashTarget, fw string, force bool) error
 	FlashStatus(t FlashTarget) (Status, error)
 	FlashAbort(t FlashTarget) error
+	DiskMount(image string, medium DiskMedium) error // record a disk image to attach on the next power on
+	DiskEject() error                                // forget the recorded disk image
+	DiskStatus() error                               // report the recorded disk image, if any
 }
 
 // Config carries resolved, driver-agnostic options into a driver constructor.

@@ -5,6 +5,7 @@
 package exec
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +31,43 @@ func TestStreamReadsStdoutThenWaits(t *testing.T) {
 	}
 	if err := wait(); err != nil {
 		t.Errorf("wait() = %v, want nil", err)
+	}
+}
+
+// TestRunInteractiveOutPreservesStdoutStderrOrder covers the reordering bug
+// found live: a console session retrying a flaky telnet attach through
+// RunInteractiveOut saw the process's own stderr diagnosis land ahead of an
+// earlier stdout line, run together with no line break between them. Two
+// independent, unsynchronized copying goroutines (Go's default when Stdout
+// and Stderr are separate io.Writer-backed pipes) can service reads in
+// either order regardless of which fd the child actually wrote to first.
+// RunInteractiveOut instead shares one real pipe for both streams, so the
+// child's own write(2) calls land in the exact order it issued them.
+func TestRunInteractiveOutPreservesStdoutStderrOrder(t *testing.T) {
+	runner := &CmdRunner{Target: Target{Host: "localhost"}}
+	var buf bytes.Buffer
+
+	err := runner.RunInteractiveOut(&buf, "sh", "-c",
+		"echo one; echo two >&2; echo three; echo four >&2")
+	if err != nil {
+		t.Fatalf("RunInteractiveOut: %v", err)
+	}
+	want := "one\ntwo\nthree\nfour\n"
+	if buf.String() != want {
+		t.Errorf("output = %q, want %q (stdout/stderr interleaved out of order)", buf.String(), want)
+	}
+}
+
+func TestRunInteractiveOutSurfacesAFailure(t *testing.T) {
+	runner := &CmdRunner{Target: Target{Host: "localhost"}}
+	var buf bytes.Buffer
+
+	err := runner.RunInteractiveOut(&buf, "sh", "-c", "echo failing >&2; exit 1")
+	if err == nil {
+		t.Fatal("want an error from a failing command")
+	}
+	if !strings.Contains(buf.String(), "failing") {
+		t.Errorf("output = %q, want it to still carry the process's own output", buf.String())
 	}
 }
 
