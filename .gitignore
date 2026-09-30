@@ -8,3 +8,5 @@
 coverage.*
 work/
 .claude/
+# Added by goreleaser init:
+dist/

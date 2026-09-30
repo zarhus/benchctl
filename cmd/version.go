@@ -10,6 +10,11 @@ import (
 	"github.com/zarhus/benchctl/platform"
 )
 
+var (
+	tag      = "dev"
+	revision = ""
+)
+
 // versionLine is the full --version text: the VCS stamp plus the binary's
 // default platform, which tells the build flavors apart.
 func versionLine() string {
@@ -20,26 +25,28 @@ func versionLine() string {
 	return v
 }
 
-// version returns a build identifier read from the VCS stamp Go records for any
-// build or install made in a git checkout: the commit revision, suffixed with
-// "-dirty" when the working tree had uncommitted changes. It falls back to "dev"
-// when no stamp is present, such as under `go run`.
+// version returns a build identifier injected via ldflags or read from the VCS
+// stamp Go records for any build or install made in a git checkout:
+// the commit revision, suffixed with "-dirty" when the working tree had
+// uncommitted changes. It falls back to "dev" when no stamp is present, such as
+// under `go run`.
 func version() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return formatVersion("", false)
-	}
-	var revision string
-	var modified bool
-	for _, setting := range info.Settings {
-		switch setting.Key {
-		case "vcs.revision":
-			revision = setting.Value
-		case "vcs.modified":
-			modified = setting.Value == "true"
+	modified := false
+	if revision == "" {
+		info, ok := debug.ReadBuildInfo()
+		if ok {
+			for _, setting := range info.Settings {
+				switch setting.Key {
+				case "vcs.revision":
+					revision = setting.Value
+				case "vcs.modified":
+					modified = setting.Value == "true"
+				}
+			}
 		}
 	}
-	return formatVersion(revision, modified)
+
+	return formatVersion(tag, revision, modified)
 }
 
 // shortLen is how many leading hex characters of a commit identify a build.
@@ -50,7 +57,7 @@ const shortLen = 12
 // formatting is testable without a real build. An empty revision means the build
 // carries no stamp. The commit is abbreviated to its leading characters and gets
 // a "-dirty" suffix when the working tree had uncommitted changes at build time.
-func formatVersion(revision string, modified bool) string {
+func formatVersion(tag_v string, revision string, modified bool) string {
 	if revision == "" {
 		return "dev"
 	}
@@ -60,5 +67,9 @@ func formatVersion(revision string, modified bool) string {
 	if modified {
 		return revision + "-dirty"
 	}
-	return revision
+	if tag_v == "dev" {
+		return revision
+	} else {
+		return tag_v + " (" + revision + ")"
+	}
 }

@@ -13,23 +13,27 @@ import (
 
 func TestFormatVersion(t *testing.T) {
 	cases := []struct {
+		tag      string
 		revision string
 		modified bool
 		want     string
 	}{
+		// No tag, not printed
 		// No VCS stamp (e.g. `go run`) falls back to a fixed label.
-		{"", false, "dev"},
-		{"", true, "dev"},
+		{"dev", "", false, "dev"},
+		{"dev", "", true, "dev"},
 		// A full commit SHA is abbreviated to its leading 12 characters.
-		{"fef7778621288afe235c65ebab58a38bef566bba", false, "fef777862128"},
-		{"fef7778621288afe235c65ebab58a38bef566bba", true, "fef777862128-dirty"},
+		{"dev", "fef7778621288afe235c65ebab58a38bef566bba", false, "fef777862128"},
+		{"dev", "fef7778621288afe235c65ebab58a38bef566bba", true, "fef777862128-dirty"},
 		// A revision already shorter than the limit is left as is.
-		{"5d4f57d", false, "5d4f57d"},
+		{"dev", "5d4f57d", false, "5d4f57d"},
 		// A dirty working tree at build time is marked so the build is traceable.
-		{"5d4f57d", true, "5d4f57d-dirty"},
+		{"dev", "5d4f57d", true, "5d4f57d-dirty"},
+		// When tag is set it is printed with revision
+		{"v1.0.0", "fef777862128", false, "v1.0.0 (fef777862128)"},
 	}
 	for _, tc := range cases {
-		if got := formatVersion(tc.revision, tc.modified); got != tc.want {
+		if got := formatVersion(tc.tag, tc.revision, tc.modified); got != tc.want {
 			t.Errorf("formatVersion(%q, %v) = %q, want %q", tc.revision, tc.modified, got, tc.want)
 		}
 	}

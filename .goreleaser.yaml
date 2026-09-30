@@ -1,0 +1,91 @@
+# SPDX-FileCopyrightText: 2026 Michał Iwanicki <iwanicki92@gmail.com>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+---
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./...
+    env:
+      - CGO_ENABLED=0
+    goarch:
+      - amd64
+    goos:
+      - linux
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/zarhus/benchctl/cmd.tag={{ .Tag }} -X github.com/zarhus/benchctl/cmd.revision={{ .Commit }}
+
+gomod:
+  proxy: true
+
+archives:
+  - formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - src: LICENSES/*
+        info:
+          owner: root
+          group: root
+          mtime: "{{ .CommitDate }}"
+      - src: README.md
+        info:
+          owner: root
+          group: root
+          mtime: "{{ .CommitDate }}"
+    builds_info:
+      group: root
+      owner: root
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+  use: git
+
+checksum:
+  split: true
+
+nfpms:
+  - package_name: benchctl
+    formats:
+      - deb
+      - rpm
+    maintainer: "Michał Iwanicki <michal.iwanicki@3mdeb.com>"
+    description: "Application to control BenchRacks"
+    homepage: "https://github.com/zarhus/benchtl"
+    license: "Apache 2.0"
+    mtime: "{{ .CommitDate }}"
+    overrides:
+      deb:
+        dependencies:
+          - openssh-client
+          - sshpass
+      rpm:
+        dependencies:
+          - openssh-clients
+          - sshpass
+
+    rpm:
+      buildhost: builder
+
+release:
+  footer: >-
+
+    ---
+
+    Released by [GoReleaser](https://github.com/goreleaser/goreleaser).
