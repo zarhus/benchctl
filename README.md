@@ -191,114 +191,106 @@ serial-over-LAN, or a read-only UART1 debug line. `flash status` and
 within one command and leaves no update state to query or abort.
 
 `fvp` (`platform/fvp.go`) drives the real Arm RD-V3 Fixed Virtual Platform
-(`FVP_RD_V3`) directly: "power" is the model process's lifetime, "console" is
-a direct telnet connection to its own console UART terminal, and "flash"
-records which BL33 image (a normal build's own `uefi.bin`, or a `coreboot.rom`
-built for the same entry point) the next power-on boots. There is no external
-launcher script - this driver knows how to invoke the model itself, the same
-way `benchrack.go` drives BenchRack's GPIO and SPI mux directly rather than
-shelling out to a board-specific script. Parameter names, defaults and the
-port-announcement format come from `$BENCHCTL_FVP_MODEL --list-params` and
-from running the real binary, confirmed empirically rather than guessed; see
+(`FVP_RD_V3`) directly: "power" is the model process's lifetime, "console" is a
+direct telnet connection to its own console UART terminal, and "flash" records
+which image (a FIP, a normal build's own `uefi.bin`, or a `coreboot.rom` built
+for the same entry point) the next power-on boots. There is no external launcher
+script - this driver knows how to invoke the model itself, the same way
+`benchrack.go` drives BenchRack's GPIO and SPI mux directly rather than shelling
+out to a board-specific script. Parameter names, defaults and the
+port-announcement format come from `$BENCHCTL_FVP_MODEL --list-params` and from
+running the real binary, confirmed empirically rather than guessed; see
 `examples/rdv3-fvp/run.md` in the loopctl repository for how.
 
 It exists so a port can be driven through the same hardware-gated path
-(loopctl's hardware confirmation, one benchctl command per step) before there
-is a real bench, and it is meant to be built into the same binary as a real
+(loopctl's hardware confirmation, one benchctl command per step) before there is
+a real bench, and it is meant to be built into the same binary as a real
 platform driver, selected at runtime with `--platform fvp` or
-`BENCHCTL_PLATFORM=fvp` - the default stays whatever a binary's `main` sets
-with `platform.SetDefault`. It runs entirely locally, so there is no SSH
-user, no board wiring, and `--host`/`BENCHCTL_HOST` only need to be set to
-satisfy the same "never silently act on localhost" check every platform goes
-through (`localhost` is correct and sufficient). `power off` sends `SIGKILL`
-directly rather than trying a graceful signal first: an FVP has no shutdown
-hook of its own to catch it, only a booted guest OS does, over SSH, which is
-a different operation entirely.
+`BENCHCTL_PLATFORM=fvp` - the default stays whatever a binary's `main` sets with
+`platform.SetDefault`. It runs entirely locally, so there is no SSH user, no
+board wiring, and `--host`/`BENCHCTL_HOST` only need to be set to satisfy the
+same "never silently act on localhost" check every platform goes through
+(`localhost` is correct and sufficient). `power off` sends `SIGKILL` directly
+rather than trying a graceful signal first: an FVP has no shutdown hook of its
+own to catch it, only a booted guest OS does, over SSH, which is a different
+operation entirely.
 
-`power on` disables every UART terminal's own telnet except ns_uart0's: left
-at their default, each one opens a port and - wherever a real display is
-attached - auto-launches its own xterm (the model's default
-`terminal_command` behaviour), one window per terminal, for consoles this
-driver never intended to expose.
+`power on` disables every UART terminal's own telnet except ns_uart0's: left at
+their default, each one opens a port and - wherever a real display is attached -
+auto-launches its own xterm (the model's default `terminal_command` behaviour),
+one window per terminal, for consoles this driver never intended to expose.
 
 Configure it with just two things:
 
 - `BENCHCTL_FVP_MODEL` (required) - the path to the `FVP_RD_V3` model binary.
 - `BENCHCTL_FVP_CONSOLE_PORT` (default `6000`) - the port requested for the
-  console UART's telnet terminal, and what `console` trusts the model
-  actually opened. Deliberately not `5000`, every UART terminal's own
-  default: each one wants it and auto-increments from there on collision
-  (confirmed against a real run - with every terminal present, that cluster
-  occupies `5000`-`5012`), so requesting `5000` for ns_uart0 too risks
-  landing on whatever the others left free rather than the port actually
-  asked for. `6000` sits clear of that cluster, so the request reliably
-  succeeds and `console` does not need to read the model's own announcement
-  back out of its process log to find out where it actually landed.
+  console UART's telnet terminal, and what `console` trusts the model actually
+  opened. Deliberately not `5000`, every UART terminal's own default: each one
+  wants it and auto-increments from there on collision (confirmed against a real
+  run - with every terminal present, that cluster occupies `5000`-`5012`), so
+  requesting `5000` for ns_uart0 too risks landing on whatever the others left
+  free rather than the port actually asked for. `6000` sits clear of that
+  cluster, so the request reliably succeeds and `console` does not need to read
+  the model's own announcement back out of its process log to find out where it
+  actually landed.
 
 Plus, less often:
 
 - `BENCHCTL_FVP_WORKDIR` (default `.fvp`) - where its pidfile, the launched
-  process's own stdout/stderr, the console UART's transcript, the two dummy
-  NOR flash images the platform expects present (created automatically), and
-  the recorded boot image all live.
+  process's own stdout/stderr, the console UART's transcript, the two dummy NOR
+  flash images the platform expects present (created automatically), and the
+  recorded boot image all live.
 - `--board` (default `rdv3`) - which of `platform/fvp.go`'s board profiles to
   use; a second FVP-modelled reference design adds an entry there.
 
-There is no FIP anywhere in this driver's boot flow. The firmware under
-test is built with `PLAT_RESET_TO_BL31=1` (see `output/rdv3/boot_info.sh`),
-which TF-A's own reference build for this mode takes further than just
-skipping BL1/BL2/BL32: its own
-`model-scripts/rdinfra/platforms/rdv3/run_model.sh` preloads RSE, the eight
-RESET_TO_BL31 companions, and even BL33 (`uefi.bin`) directly into DRAM,
-never touching `ros.board.flashloader0` at all. This driver does the same,
-generalized to take either payload: `flash write host <image>` records
-`image` - a normal build's own `uefi.bin`, or a `coreboot.rom` built for the
-same entry point - as the one thing that varies. It is preloaded directly
-into DRAM at BL31's normal-world entry point on the next power on; a
-`coreboot.rom` built to run from that address boots exactly the way
-`uefi.bin` does, console output included. `flash write host` with a new
-image while one is already recorded simply replaces it - there is no
-separate FIP-vs-BL33 distinction to override. `AC*`, `ConsoleSOL` and the
-`bmc` flash target all report "not implemented": a virtual platform has no
-mains feed and no separate BMC.
+`flash write host <image>` records the image the next power on boots. `AC*`,
+`ConsoleSOL` and the `bmc` flash target all report "not implemented": a virtual
+platform has no mains feed and no separate BMC.
 
-`power on` with nothing flashed yet fails immediately, naming
-`flash write host <uefi.bin|coreboot.rom>` rather than launching the model
-with nothing to preload as BL33. Every RESET_TO_BL31 firmware file BL31
-itself needs to reach BL33 at all - the RSE (Runtime Security Engine) boot
-ROM and CPU data (`tf_m_rom.bin`, `tf_m_flash.bin`, `tf_m_vm0_0.bin`,
-`tf_m_vm1_0.bin`) plus the eight companions (`scp_ramfw.bin`,
-`mcp_ramfw.bin`, `tf-bl31.bin`, `rmm.img`, `<board>_spmc_sp_manifest.dtb`,
-`<board>_nt_fw_config.dtb`, `stmm.pkg`, `hafnium.bin`) - is likewise
-mandatory now: there is no FIP-based fallback to degrade to, so a missing
-one is reported clearly before the model is even launched, rather than
-producing a silently boot-output-less run. Rather than a flat layout of its
-own invention, `power on` looks for all of it inside `BENCHCTL_FVP_WORKDIR`'s
-own mirror of a real firmware build's own `output/<board>` tree, in exactly
-the layout that build produces it (confirmed against
+A FIP (`fip-uefi.bin`, recognised by its header) goes on
+`ros.board.flashloader0`, as in
+`model-scripts/rdinfra/platforms/rdv3/run_model.sh`. Only the RSE images
+(`tf_m_rom.bin`, `tf_m_flash.bin`, `tf_m_vm0_0.bin`, `tf_m_vm1_0.bin`) are
+preloaded, from the FIP's own directory.
+
+Any other image (`uefi.bin`, or a `coreboot.rom` built for the same entry point)
+is BL33 for firmware built with `PLAT_RESET_TO_BL31=1`. It is preloaded into
+DRAM at BL31's normal-world entry point, together with the RSE images and the
+eight RESET_TO_BL31 companions (`scp_ramfw.bin`, `mcp_ramfw.bin`, `tf-bl31.bin`,
+`rmm.img`, `<board>_spmc_sp_manifest.dtb`, `<board>_nt_fw_config.dtb`,
+`stmm.pkg`, `hafnium.bin`).
+
+`power on` with nothing flashed, or with a firmware file missing, fails before
+the model is launched.
+
+For the RESET_TO_BL31 flow, rather than a flat layout of its own invention,
+`power on` looks for these files inside `BENCHCTL_FVP_WORKDIR`'s own mirror of a
+real firmware build's own `output/<board>` tree, in exactly the layout that
+build produces it (confirmed against
 `model-scripts/rdinfra/platforms/rdv3/run_model.sh`'s own `$OUTDIR`/`$ROOTDIR`
 paths):
 
-- `output/<board>/<board>/` - the flat set a build also stages beside the
-  FIP: `tf_m_rom.bin`, `tf_m_flash.bin`, `tf_m_vm0_0.bin`, `tf_m_vm1_0.bin`,
+- `output/<board>/<board>/` - the flat set a build also stages beside the FIP:
+  `tf_m_rom.bin`, `tf_m_flash.bin`, `tf_m_vm0_0.bin`, `tf_m_vm1_0.bin`,
   `scp_ramfw.bin`, `mcp_ramfw.bin`, `tf-bl31.bin`, `rmm.img`.
 - `output/<board>/components/<board>/` - the remaining three companions
   (`<board>_spmc_sp_manifest.dtb`, `<board>_nt_fw_config.dtb`, `stmm.pkg`),
   which a build never flattens next to the FIP.
-- `output/<board>/components/` - `hafnium.bin`, one level higher than the
-  rest since a real build shares it across boards.
+- `output/<board>/components/` - `hafnium.bin`, one level higher than the rest
+  since a real build shares it across boards.
 
-The simplest setup is a single symlink, once: `ln -s /path/to/build/output
-$BENCHCTL_FVP_WORKDIR/output`. A Fast Models license (`ARMLMD_LICENSE_FILE`)
-is needed for anything past a short evaluation window regardless.
+The simplest setup is a single symlink, once:
+`ln -s /path/to/build/output $BENCHCTL_FVP_WORKDIR/output`. A Fast Models
+license (`ARMLMD_LICENSE_FILE`) is needed for anything past a short evaluation
+window regardless.
 
-PCIe hierarchy files for `pcie_group_1` through `_3` (static examples that
-ship with `model-scripts`, e.g. `example_pcie_hierarchy_1.json`, not
-something a firmware build produces) are looked for in
-`BENCHCTL_FVP_WORKDIR` instead - drop a copy there, the same way the two NOR
-flash images live there - and wired in per group when present; a missing one
-is just omitted, with a note, rather than failing the launch. `pcie_group_0`
-needs no file of its own and is always configured.
+PCIe hierarchy files for `pcie_group_1` through `_3` (static examples that ship
+with `model-scripts`, e.g. `example_pcie_hierarchy_1.json`, not something a
+firmware build produces) are looked for in `BENCHCTL_FVP_WORKDIR` instead - drop
+a copy there, the same way the two NOR flash images live there - and wired in
+per group when present; a missing one is just omitted, with a note, rather than
+failing the launch. `pcie_group_0` needs no file of its own and is always
+configured.
 
 Adding another platform is one package that implements the `Platform` interface
 and registers itself with `platform.Register()` from its `init()`. Drivers can

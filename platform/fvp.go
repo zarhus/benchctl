@@ -92,7 +92,7 @@ type fvpPlatform struct {
 	pidFile         string
 	processLog      string // the launched process's own stdout/stderr
 	consoleLog      string // the console UART's own transcript (ns_uart0.out_file), written by the model itself
-	bootImageRecord string // holds the path of the BL33 image (`flash write host`) the next power-on preloads directly into DRAM
+	bootImageRecord string // holds the path of the image (`flash write host`) the next power-on boots: a FIP, or a BL33 image preloaded directly into DRAM
 	diskRecord      string // holds the medium+path of the disk image the next power-on attaches, like bootImageRecord
 	consolePort     int    // the port requested via terminal_ns_uart0.start_port, and what Console trusts the model actually opened
 	irisPort        int    // the port requested via --iris-port for the model's Iris debug/control server
@@ -449,9 +449,15 @@ const irisTimeout = 3 * time.Second
 // mirrors real hardware's mains/soft-power split: applying AC does not by
 // itself turn the host on.
 //
-// There is no FIP involved anywhere in this flow: the firmware under test is
+// The image `flash write host` recorded selects one of two boot flows. A
+// FIP (fip-uefi.bin, see isFIP) boots the way a default build does
+// (PLAT_RESET_TO_BL31=0): the FIP goes on ros.board.flashloader0, only the
+// RSE images are preloaded, and BL1/BL2 load the rest from the FIP. The
+// RSE images come from the FIP's own directory (see resolveFIPComponents).
+//
+// Any other image is BL33 for the RESET_TO_BL31 flow. That firmware is
 // built with PLAT_RESET_TO_BL31=1 (see output/rdv3/boot_info.sh), which
-// means BL1/BL2/BL32 are never fetched from one at all, and TF-A's own
+// means BL1/BL2/BL32 are never fetched from a FIP at all, and TF-A's own
 // reference build for this mode does not stop there - its own
 // model-scripts/rdinfra/platforms/rdv3/run_model.sh preloads RSE, the eight
 // RESET_TO_BL31 companions, and even BL33 (uefi.bin) directly. This driver
@@ -481,14 +487,27 @@ func (fv *fvpPlatform) start() error {
 	if err := os.MkdirAll(fv.workDir, 0o755); err != nil {
 		return err
 	}
-	// RSE (the root of the boot chain, ahead of everything else) and the
-	// RESET_TO_BL31 companions BL31 itself needs: all of it is mandatory
-	// now that there is no FIP-based fallback boot to fall back to - a
-	// missing file here is a configuration error, not a degraded-but-alive
-	// mode, so it is reported clearly before the model is even launched.
-	comp := resolveOutputComponents(fv.workDir, fv.board)
-	if !comp.ok() {
-		return fmt.Errorf("missing one or more required firmware files (tf_m_rom.bin, tf_m_flash.bin, tf_m_vm0_0.bin, tf_m_vm1_0.bin, scp_ramfw.bin, mcp_ramfw.bin, tf-bl31.bin, %s_spmc_sp_manifest.dtb, %s_nt_fw_config.dtb, hafnium.bin, stmm.pkg, rmm.img) under %s", fv.board, fv.board, filepath.Join(fv.workDir, "output", fv.board))
+	fip, err := isFIP(bootImage)
+	if err != nil {
+		return err
+	}
+	// The images preloaded for the selected boot flow. Every file is
+	// mandatory, so a missing one is reported before the model is launched.
+	var preload []string
+	if fip {
+		comp := resolveFIPComponents(filepath.Dir(bootImage))
+		if missing := comp.missing(); len(missing) > 0 {
+			return fmt.Errorf("missing RSE firmware next to the FIP %s: %s", bootImage, strings.Join(missing, ", "))
+		}
+		preload = comp.args()
+	} else {
+		// RSE (the root of the boot chain, ahead of everything else) and
+		// the RESET_TO_BL31 companions BL31 itself needs.
+		comp := resolveOutputComponents(fv.workDir, fv.board)
+		if !comp.ok() {
+			return fmt.Errorf("missing one or more required firmware files (tf_m_rom.bin, tf_m_flash.bin, tf_m_vm0_0.bin, tf_m_vm1_0.bin, scp_ramfw.bin, mcp_ramfw.bin, tf-bl31.bin, %s_spmc_sp_manifest.dtb, %s_nt_fw_config.dtb, hafnium.bin, stmm.pkg, rmm.img) under %s", fv.board, fv.board, filepath.Join(fv.workDir, "output", fv.board))
+		}
+		preload = comp.args(bootImage)
 	}
 	nor1, nor2, err := fv.norFlashImages()
 	if err != nil {
@@ -507,15 +526,15 @@ func (fv *fvpPlatform) start() error {
 		"-C", "ros.disable_visualisation=true",
 		// ros.board.flashloader0 is the platform's own NOR flash chip
 		// (V2M_FLASH0_BASE/RDV3_FLASH_BASE, 0x08000000 in both TF-A's and
-		// coreboot's own headers) - not a FIP-specific concept, and never
-		// read by BL31/BL33 in this RESET_TO_BL31 flow (confirmed live: a
-		// normal build's own uefi.bin boots fully with nothing mapped
-		// here). It matters for a full flash-shaped image like
+		// coreboot's own headers). In the FIP flow BL1 and BL2 read the
+		// FIP from it. In the RESET_TO_BL31 flow BL31/BL33 never read it
+		// (confirmed live: a normal build's own uefi.bin boots fully with
+		// nothing mapped here). It matters for a full flash-shaped image like
 		// coreboot.rom though: bootblock itself runs fine from the DRAM
 		// preload below, but coreboot's own CBFS/FMAP lookup afterward
 		// reads from this flash device unconditionally, wherever bootblock
-		// happens to be executing from - confirmed live, "Cannot locate
-		// COREBOOT CBFS" otherwise. Mapping bootImage here too is a no-op
+		// happens to be executing from - confirmed live, coreboot fails to
+		// locate its CBFS otherwise. Mapping bootImage here too is a no-op
 		// for a plain BL33 payload and required for a CBFS one, so it is
 		// done unconditionally rather than trying to guess which kind
 		// bootImage is.
@@ -647,37 +666,7 @@ func (fv *fvpPlatform) start() error {
 		fmt.Fprintf(fv.progress, "Attaching disk image %s (%s)...\n", path, medium)
 	}
 
-	// RSE (Runtime Security Engine) boot ROM and CPU-visible data, the
-	// RESET_TO_BL31 companions BL31 needs, and the BL33 image itself
-	// (`flash write host` - a normal build's own uefi.bin, or a coreboot.rom
-	// built for the same entry point): every one of these is preloaded
-	// directly, none of it fetched from a FIP. comp.ok() above already
-	// confirmed everything but bootImage is present. Addresses and the
-	// component set come directly from
-	// model-scripts/rdinfra/platforms/rdv3/run_model.sh's own
-	// RESET_TO_BL31_PRELOAD_PARAMS, not guesswork - including
-	// PRELOADED_BL33_BASE=0xE0000000 (trusted-firmware-a's own
-	// plat/arm/board/neoverse_rd/platform/rdv3/platform.mk), which is what
-	// resolves to ros.board.dram's 0x60000000 offset below: ros.board.dram
-	// itself is addressed relative to DRAM_START=0x80000000, and BL31 jumps
-	// there unconditionally regardless of which image was preloaded, so a
-	// coreboot.rom built to run from that same address boots exactly the
-	// way uefi.bin does, console output included.
-	argv = append(argv,
-		"-C", "css.sysctrl.rse.rom.raw_image="+comp.rseRom,
-		"--data", "css.sysctrl.rse.cpu="+comp.rseFlash+"@0xB0000000",
-		"--data", "css.sysctrl.rse.cpu="+comp.rseVM0+"@0x31000400",
-		"--data", "css.sysctrl.rse.cpu="+comp.rseVM1+"@0x31080000",
-		"--data", "css.sysctrl.scp.cpu="+comp.scpRamfw+"@0x0",
-		"--data", "css.sysctrl.mcp.cpu="+comp.mcpRamfw+"@0x0",
-		"--data", "css.ap_periph.arsm_sram="+comp.bl31+"@0x63000",
-		"--data", "css.ap_periph.arsm_sram="+comp.spmcManifest+"@0x1f500",
-		"--data", "ros.board.dram="+comp.ntFwConfig+"@0x73000000",
-		"--data", "ros.board.dram="+comp.hafnium+"@0x7a889000",
-		"--data", "ros.board.dram="+comp.stmm+"@0x7AA00000",
-		"--data", "ros.board.dram="+comp.rmm+"@0x7B200000",
-		"--data", "ros.board.dram="+bootImage+"@0x60000000",
-	)
+	argv = append(argv, preload...)
 
 	cmd := osexec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = logFile
@@ -687,7 +676,11 @@ func (fv *fvpPlatform) start() error {
 		return fmt.Errorf("start model: %w", err)
 	}
 	pid := cmd.Process.Pid
-	fmt.Fprintf(fv.progress, "Model starting (pid %d), preloading %s as BL33, paused - run 'power on' to start execution...\n", pid, bootImage)
+	if fip {
+		fmt.Fprintf(fv.progress, "Model starting (pid %d), booting the FIP %s from flashloader0, paused - run 'power on' to start execution...\n", pid, bootImage)
+	} else {
+		fmt.Fprintf(fv.progress, "Model starting (pid %d), preloading %s as BL33, paused - run 'power on' to start execution...\n", pid, bootImage)
+	}
 
 	// A model that fails fast (bad image, missing dependency) exits within a
 	// beat. Catching that here turns a silent no-op boot into an error naming
@@ -752,8 +745,8 @@ func (fv *fvpPlatform) waitForConsoleReady(pid int) error {
 
 // outputComponents are every firmware file the RESET_TO_BL31 boot flow needs
 // beyond the BL33 image itself (`flash write host`): the RSE boot chain and
-// the eight companions BL31 needs to reach BL33 at all - all of it always
-// required now that there is no FIP-based boot to fall back to. Their paths
+// the eight companions BL31 needs to reach BL33 at all - all of it
+// required in that flow. Their paths
 // are resolved from workDir's own copy of a real build's own output/<board>
 // tree, mirroring exactly where that build places them (confirmed against
 // model-scripts/rdinfra/platforms/rdv3/run_model.sh's own $OUTDIR/$ROOTDIR
@@ -811,6 +804,98 @@ func (c outputComponents) ok() bool {
 		}
 	}
 	return true
+}
+
+// args returns the model arguments that load the RSE boot chain, the
+// companions and bootImage as BL33. Addresses and the component set come
+// from model-scripts/rdinfra/platforms/rdv3/run_model.sh's own
+// RESET_TO_BL31_PRELOAD_PARAMS, including PRELOADED_BL33_BASE=0xE0000000
+// (trusted-firmware-a's own
+// plat/arm/board/neoverse_rd/platform/rdv3/platform.mk), which resolves to
+// ros.board.dram's 0x60000000 offset below: ros.board.dram itself is
+// addressed relative to DRAM_START=0x80000000, and BL31 jumps there
+// unconditionally regardless of which image was preloaded, so a
+// coreboot.rom built to run from that same address boots exactly the way
+// uefi.bin does, console output included.
+func (c outputComponents) args(bootImage string) []string {
+	return []string{
+		"-C", "css.sysctrl.rse.rom.raw_image=" + c.rseRom,
+		"--data", "css.sysctrl.rse.cpu=" + c.rseFlash + "@0xB0000000",
+		"--data", "css.sysctrl.rse.cpu=" + c.rseVM0 + "@0x31000400",
+		"--data", "css.sysctrl.rse.cpu=" + c.rseVM1 + "@0x31080000",
+		"--data", "css.sysctrl.scp.cpu=" + c.scpRamfw + "@0x0",
+		"--data", "css.sysctrl.mcp.cpu=" + c.mcpRamfw + "@0x0",
+		"--data", "css.ap_periph.arsm_sram=" + c.bl31 + "@0x63000",
+		"--data", "css.ap_periph.arsm_sram=" + c.spmcManifest + "@0x1f500",
+		"--data", "ros.board.dram=" + c.ntFwConfig + "@0x73000000",
+		"--data", "ros.board.dram=" + c.hafnium + "@0x7a889000",
+		"--data", "ros.board.dram=" + c.stmm + "@0x7AA00000",
+		"--data", "ros.board.dram=" + c.rmm + "@0x7B200000",
+		"--data", "ros.board.dram=" + bootImage + "@0x60000000",
+	}
+}
+
+// fipTOCMagic is the first four bytes of every FIP: TOC_HEADER_NAME
+// (0xAA640001) from trusted-firmware-a's
+// include/tools_share/firmware_image_package.h, stored little-endian.
+var fipTOCMagic = []byte{0x01, 0x00, 0x64, 0xaa}
+
+// isFIP reports whether the image at path starts with the FIP table of
+// contents header. A file shorter than the header is not a FIP.
+func isFIP(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	head := make([]byte, len(fipTOCMagic))
+	if _, err := io.ReadFull(f, head); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return false, nil
+		}
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+	return bytes.Equal(head, fipTOCMagic), nil
+}
+
+// fipComponents are the RSE images the FIP flow preloads: the RSE boot ROM
+// and the three images loaded into the RSE CPU's memory. A build places
+// them next to the FIP in output/<board>/<board>/, and in this flow
+// tf_m_flash.bin also carries BL1, so they are taken from the FIP's own
+// directory to keep them from the same build.
+type fipComponents struct {
+	rseRom, rseFlash, rseVM0, rseVM1 string
+}
+
+func resolveFIPComponents(dir string) fipComponents {
+	return fipComponents{
+		rseRom:   filepath.Join(dir, "tf_m_rom.bin"),
+		rseFlash: filepath.Join(dir, "tf_m_flash.bin"),
+		rseVM0:   filepath.Join(dir, "tf_m_vm0_0.bin"),
+		rseVM1:   filepath.Join(dir, "tf_m_vm1_0.bin"),
+	}
+}
+
+// missing returns the paths of the RSE images that are not present.
+func (c fipComponents) missing() []string {
+	var out []string
+	for _, f := range []string{c.rseRom, c.rseFlash, c.rseVM0, c.rseVM1} {
+		if _, err := os.Stat(f); err != nil {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// args returns the model arguments that preload the RSE images, at the
+// addresses model-scripts/rdinfra/platforms/rdv3/run_model.sh uses.
+func (c fipComponents) args() []string {
+	return []string{
+		"-C", "css.sysctrl.rse.rom.raw_image=" + c.rseRom,
+		"--data", "css.sysctrl.rse.cpu=" + c.rseFlash + "@0xB0000000",
+		"--data", "css.sysctrl.rse.cpu=" + c.rseVM0 + "@0x31000400",
+		"--data", "css.sysctrl.rse.cpu=" + c.rseVM1 + "@0x31080000",
+	}
 }
 
 // norFlashImages returns the paths of the two dummy NOR flash images the
@@ -1165,17 +1250,17 @@ func (fv *fvpPlatform) ConsoleUART1() error {
 	return ErrNotImplemented
 }
 
-// currentBootImage returns the BL33 path FlashWrite last recorded, so a
-// power on without a prior `flash write host` fails clearly rather than
-// launching the model with nothing to preload as BL33 at all.
+// currentBootImage returns the image path FlashWrite last recorded (a FIP
+// or a BL33 image), so a power on without a prior `flash write host` fails
+// clearly rather than launching the model with nothing to boot.
 func (fv *fvpPlatform) currentBootImage() (string, error) {
 	data, err := os.ReadFile(fv.bootImageRecord)
 	if err != nil {
-		return "", fmt.Errorf("no boot image recorded yet: run 'flash write host <uefi.bin|coreboot.rom>' first")
+		return "", fmt.Errorf("no boot image recorded yet: run 'flash write host <fip-uefi.bin|uefi.bin|coreboot.rom>' first")
 	}
 	path := strings.TrimSpace(string(data))
 	if path == "" {
-		return "", fmt.Errorf("no boot image recorded yet: run 'flash write host <uefi.bin|coreboot.rom>' first")
+		return "", fmt.Errorf("no boot image recorded yet: run 'flash write host <fip-uefi.bin|uefi.bin|coreboot.rom>' first")
 	}
 	return path, nil
 }
@@ -1348,7 +1433,7 @@ func (fv *fvpPlatform) FlashWrite(target FlashTarget, fw string, force bool) err
 	if err := os.WriteFile(fv.bootImageRecord, []byte(abs+"\n"), 0o644); err != nil {
 		return err
 	}
-	fmt.Fprintln(fv.progress, "Boot image recorded; it will be preloaded as BL33 from the next power ac on.")
+	fmt.Fprintln(fv.progress, "Boot image recorded; the next power ac on boots it (a FIP from flashloader0, any other image preloaded as BL33).")
 	return nil
 }
 

@@ -35,11 +35,10 @@ func testPlatform(t *testing.T, modelScript string) *fvpPlatform {
 	if !ok {
 		t.Fatalf("newFVP returned %T, want *fvpPlatform", p)
 	}
-	// start() now requires the full RESET_TO_BL31 firmware set unconditionally
-	// (there is no FIP-based fallback boot to degrade to) - stand in for a
-	// real firmware build so every test that powers on does not have to set
-	// this up itself; the two tests that specifically cover the missing-file
-	// case remove it again.
+	// start() requires the full RESET_TO_BL31 firmware set for any image
+	// that is not a FIP - stand in for a real firmware build so every test
+	// that powers on does not have to set this up itself; the two tests that
+	// specifically cover the missing-file case remove it again.
 	populateOutputComponents(t, fv)
 	return fv
 }
@@ -493,10 +492,10 @@ while :; do sleep 0.05; done
 	}
 }
 
-// TestStartFailsWhenFirmwareMissing covers the other side of that fix: since
-// there is no FIP-based boot to fall back to, a missing companion is now a
-// configuration error reported before the model is even launched, not a
-// degraded-but-alive mode.
+// TestStartFailsWhenFirmwareMissing covers the other side of that fix: in
+// the RESET_TO_BL31 flow a missing companion is a configuration error
+// reported before the model is even launched, not a degraded-but-alive
+// mode.
 func TestStartFailsWhenFirmwareMissing(t *testing.T) {
 	dir := t.TempDir()
 	model := writeScript(t, dir, "model.sh", `#!/bin/sh
@@ -520,6 +519,138 @@ while :; do sleep 0.05; done
 	}
 	if !strings.Contains(err.Error(), "missing one or more required firmware files") {
 		t.Errorf("error = %q, want it to name the missing firmware", err)
+	}
+	if status, _ := fv.ACPowerState(); status.Power != PowerOff {
+		t.Errorf("ACPowerState = %v, want off: a failed start must not leave a model process running", status)
+	}
+}
+
+// writeFIP writes a stand-in FIP (the ToC magic and some padding) and the
+// four RSE images a build places next to it, and returns the FIP's path.
+func writeFIP(t *testing.T, dir string) string {
+	t.Helper()
+	out := filepath.Join(dir, "output", "rdv3", "rdv3")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fip := filepath.Join(out, "fip-uefi.bin")
+	if err := os.WriteFile(fip, append(append([]byte{}, fipTOCMagic...), make([]byte, 60)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"tf_m_rom.bin", "tf_m_flash.bin", "tf_m_vm0_0.bin", "tf_m_vm1_0.bin"} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte("stand-in"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return fip
+}
+
+func TestIsFIP(t *testing.T) {
+	dir := t.TempDir()
+	fip := writeFIP(t, dir)
+	short := filepath.Join(dir, "short.bin")
+	if err := os.WriteFile(short, fipTOCMagic[:2], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{fip, true},
+		{writeImage(t, dir, "uefi.bin"), false},
+		{short, false},
+	} {
+		got, err := isFIP(tc.path)
+		if err != nil {
+			t.Fatalf("isFIP(%s): %v", tc.path, err)
+		}
+		if got != tc.want {
+			t.Errorf("isFIP(%s) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+	if _, err := isFIP(filepath.Join(dir, "absent.bin")); err == nil {
+		t.Error("isFIP on a missing file: want an error")
+	}
+}
+
+// TestStartBootsAFIPFromFlashloader0 covers the FIP flow: the FIP goes on
+// flashloader0, the RSE images come from the FIP's own directory, and none
+// of the RESET_TO_BL31 preloads are passed.
+func TestStartBootsAFIPFromFlashloader0(t *testing.T) {
+	dir := t.TempDir()
+	dump := filepath.Join(dir, "argv.txt")
+	model := writeScript(t, dir, "model.sh", `#!/bin/sh
+echo "terminal_ns_uart0: Listening for serial connection on port ${BENCHCTL_FVP_CONSOLE_PORT:-6000}"
+printf '%s\n' "$@" > "`+dump+`"
+trap 'exit 0' TERM
+while :; do sleep 0.05; done
+`)
+	fv := testPlatform(t, model)
+	fip := writeFIP(t, filepath.Join(dir, "build"))
+	if err := fv.FlashWrite(FlashHost, fip, false); err != nil {
+		t.Fatalf("FlashWrite: %v", err)
+	}
+	if err := fv.SetACPower(PowerOn); err != nil {
+		t.Fatalf("SetPower(on): %v", err)
+	}
+	t.Cleanup(func() { _ = fv.SetACPower(PowerOff) })
+
+	got, err := os.ReadFile(dump)
+	if err != nil {
+		t.Fatalf("read recorded argv: %v", err)
+	}
+	argv := string(got)
+	rse := resolveFIPComponents(filepath.Dir(fip))
+	for _, want := range []string{
+		"ros.board.flashloader0.fname=" + fip,
+		"css.sysctrl.rse.rom.raw_image=" + rse.rseRom,
+		"css.sysctrl.rse.cpu=" + rse.rseFlash + "@0xB0000000",
+		"css.sysctrl.rse.cpu=" + rse.rseVM0 + "@0x31000400",
+		"css.sysctrl.rse.cpu=" + rse.rseVM1 + "@0x31080000",
+		"css.ap_periph.ns_uart0.out_file=" + fv.consoleLog,
+		"-I",
+	} {
+		if !strings.Contains(argv, want) {
+			t.Errorf("model argv missing %q\ngot: %s", want, argv)
+		}
+	}
+	for _, unwanted := range []string{
+		"css.sysctrl.scp.cpu=",
+		"css.sysctrl.mcp.cpu=",
+		"css.ap_periph.arsm_sram=",
+		"ros.board.dram=",
+		filepath.Join(fv.workDir, "output"),
+	} {
+		if strings.Contains(argv, unwanted) {
+			t.Errorf("model argv contains %q, want no RESET_TO_BL31 preloads in the FIP flow\ngot: %s", unwanted, argv)
+		}
+	}
+}
+
+func TestStartFailsWhenRSEFirmwareIsMissingNextToTheFIP(t *testing.T) {
+	dir := t.TempDir()
+	model := writeScript(t, dir, "model.sh", `#!/bin/sh
+echo "terminal_ns_uart0: Listening for serial connection on port ${BENCHCTL_FVP_CONSOLE_PORT:-6000}"
+trap 'exit 0' TERM
+while :; do sleep 0.05; done
+`)
+	fv := testPlatform(t, model)
+	fip := writeFIP(t, filepath.Join(dir, "build"))
+	vm1 := filepath.Join(filepath.Dir(fip), "tf_m_vm1_0.bin")
+	if err := os.Remove(vm1); err != nil {
+		t.Fatal(err)
+	}
+	if err := fv.FlashWrite(FlashHost, fip, false); err != nil {
+		t.Fatalf("FlashWrite: %v", err)
+	}
+
+	err := fv.SetACPower(PowerOn)
+	if err == nil {
+		t.Cleanup(func() { _ = fv.SetACPower(PowerOff) })
+		t.Fatal("want an error powering on with an RSE image missing next to the FIP")
+	}
+	if !strings.Contains(err.Error(), vm1) {
+		t.Errorf("error = %q, want it to name %s", err, vm1)
 	}
 	if status, _ := fv.ACPowerState(); status.Power != PowerOff {
 		t.Errorf("ACPowerState = %v, want off: a failed start must not leave a model process running", status)
