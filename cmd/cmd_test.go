@@ -6,6 +6,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -359,6 +360,43 @@ func TestConsoleSourceSOLBMCIPFlagWinsOverEnvVar(t *testing.T) {
 	}
 	if fake.solBMC == nil || fake.solBMC.IP != "192.168.50.11" {
 		t.Errorf("console --source sol BMC = %+v, want the flag's address", fake.solBMC)
+	}
+}
+
+// fakeServer is a platform that can relay its console.
+type fakeServer struct {
+	fakePlatform
+	served string
+}
+
+func (fake *fakeServer) ConsoleServe(_ context.Context, addr string) error {
+	fake.served = addr
+	return nil
+}
+
+func TestConsoleServeRelaysOnTheAddress(t *testing.T) {
+	fake := &fakeServer{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "console", "--serve", "127.0.0.1:2323"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.served != "127.0.0.1:2323" || fake.console {
+		t.Errorf("served %q, attached %v, want only the relay on 127.0.0.1:2323", fake.served, fake.console)
+	}
+}
+
+func TestConsoleServeIsNotImplementedElsewhere(t *testing.T) {
+	withFakePlatform(t, &fakePlatform{})
+	if _, err := run(t, "console", "--serve", "127.0.0.1:2323"); !errors.Is(err, platform.ErrNotImplemented) {
+		t.Errorf("console --serve = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestConsoleServeRejectsASource(t *testing.T) {
+	fake := &fakeServer{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "console", "--serve", "127.0.0.1:2323", "--source", "sol"); err == nil {
+		t.Error("console --serve --source sol should be rejected")
 	}
 }
 

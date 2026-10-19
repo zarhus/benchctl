@@ -82,7 +82,7 @@ func (bmc *fakeBMC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // newTestBMC starts bmc over TLS and returns a driver that reaches it.
-func newTestBMC(t *testing.T, bmc *fakeBMC, access BMCAccess, runner *fakeRunner) (*bmcPlatform, *strings.Builder) {
+func newTestBMC(t *testing.T, bmc *fakeBMC, access BMCAccess, runner *fakeRunner) (*bmcPlatform, *syncWriter) {
 	t.Helper()
 	server := httptest.NewTLSServer(bmc)
 	t.Cleanup(server.Close)
@@ -102,7 +102,7 @@ func newTestBMC(t *testing.T, bmc *fakeBMC, access BMCAccess, runner *fakeRunner
 	driver.redfish.BaseURL = server.URL
 	driver.redfish.HTTP = server.Client()
 	driver.pollEvery = 0
-	progress := &strings.Builder{}
+	progress := &syncWriter{}
 	driver.progress = progress
 	driver.setenv = func(string, string) error { return nil }
 	driver.probeSSH = func(int) error { return nil }

@@ -358,3 +358,42 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+func TestStartPipedCarriesInputAndOutput(t *testing.T) {
+	piped, err := StartPiped([]string{"sh", "-c", `test -t 0 && read -r line && echo "read:$line"`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The terminal is in its default line mode, so Enter ends the line.
+	if _, err := piped.Write([]byte("ping\r")); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(piped)
+	if err != nil || !strings.Contains(string(out), "read:ping") {
+		t.Errorf("read %q, %v, want the program to read ping from a terminal", out, err)
+	}
+	if err := piped.Wait(); err != nil {
+		t.Errorf("Wait = %v", err)
+	}
+}
+
+func TestStartPipedStopReachesChildren(t *testing.T) {
+	// The shell waits on a sleep that holds the output open, as sshpass holds
+	// ssh.
+	piped, err := StartPiped([]string{"sh", "-c", "sleep 30; true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	piped.Stop()
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.ReadAll(piped)
+		_ = piped.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop left the program running")
+	}
+}

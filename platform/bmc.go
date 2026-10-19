@@ -5,6 +5,7 @@
 package platform
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -46,6 +47,7 @@ type bmcPlatform struct {
 	pollEvery    time.Duration
 	powerTimeout time.Duration
 	setenv       func(key, value string) error
+	startPiped   func(argv []string) (consoleProcess, error)
 	probeSSH     func(port int) error
 }
 
@@ -64,6 +66,9 @@ func newBMC(runner exec.Runner, cfg Config) Platform {
 		pollEvery:    2 * time.Second,
 		powerTimeout: 3 * time.Minute,
 		setenv:       os.Setenv,
+		startPiped: func(argv []string) (consoleProcess, error) {
+			return exec.StartPiped(argv)
+		},
 	}
 	b.probeSSH = b.sshBanner
 	b.configErr = b.configure()
@@ -353,13 +358,49 @@ func (b *bmcPlatform) Console() error {
 		return err
 	}
 	if chosen.method == "sol" {
-		return b.solSession(true).Run(b.runner, b.progress)
+		return b.solSession().Run(b.runner, b.progress)
 	}
 	session, err := b.sshSession(chosen)
 	if err != nil {
 		return err
 	}
 	return session.Run(b.runner, b.progress)
+}
+
+// ConsoleServe relays the console the settings and Redfish pick on addr. Over
+// SOL it runs sol deactivate before each attach and on the way out, as the
+// interactive console does, so a payload left open by a dropped session, its
+// own included, never blocks the next attach.
+func (b *bmcPlatform) ConsoleServe(ctx context.Context, addr string) error {
+	if b.configErr != nil {
+		return b.configErr
+	}
+	chosen, err := b.console()
+	if err != nil {
+		return err
+	}
+	var what string
+	var argv []string
+	var release func()
+	if chosen.method == "sol" {
+		session := b.solSession()
+		what, argv = session.What, session.Attach
+		release = func() {
+			fmt.Fprintf(b.progress, "Releasing any open %s...\n", session.What)
+			_, _ = b.runner.Run(session.Release...)
+		}
+	} else {
+		if err := b.setenv("SSHPASS", b.access.Password); err != nil {
+			return err
+		}
+		// The relay's client sends bytes rather than keys, so ssh's escape is off.
+		what = "host console over SSH at " + b.access.IP + " port " + strconv.Itoa(chosen.port)
+		argv = b.sshConsoleArgv(chosen, true)
+	}
+	start := func() (consoleProcess, error) { return b.startPiped(argv) }
+	relay := newConsoleRelay(what, start, b.progress)
+	relay.release = release
+	return relay.serve(ctx, addr)
 }
 
 // ConsoleSOL attaches over IPMI SOL whatever the console setting says. The
@@ -378,7 +419,7 @@ func (b *bmcPlatform) ConsoleSOL(bmc BMC) error {
 	if b.configErr = b.configure(); b.configErr != nil {
 		return b.configErr
 	}
-	return b.solSession(true).Run(b.runner, b.progress)
+	return b.solSession().Run(b.runner, b.progress)
 }
 
 // sshSession attaches to the BMC's SSH console. The password reaches sshpass in
@@ -391,16 +432,16 @@ func (b *bmcPlatform) sshSession(chosen bmcConsole) (ConsoleSession, error) {
 	return ConsoleSession{
 		What:   "host console over SSH at " + b.access.IP + " port " + port,
 		Detach: chosen.hotKey,
-		Attach: b.sshConsoleArgv(chosen),
+		Attach: b.sshConsoleArgv(chosen, b.runner.DetachHint() != ""),
 	}, nil
 }
 
-// sshConsoleArgv builds the ssh command for the BMC's console. With a detach
-// key the runner ends the session itself and ssh's escape is disabled, so "~"
-// reaches the console. Without one, ssh's "~." is the way out, and stays on.
-func (b *bmcPlatform) sshConsoleArgv(chosen bmcConsole) []string {
+// sshConsoleArgv builds the ssh command for the BMC's console. noEscape
+// disables ssh's escape, so "~" reaches the console: the runner's detach key or
+// the relay ends the session instead. Otherwise ssh's "~." is the way out.
+func (b *bmcPlatform) sshConsoleArgv(chosen bmcConsole, noEscape bool) []string {
 	argv := []string{"sshpass", "-e", "ssh", "-tt"}
-	if b.runner.DetachHint() != "" {
+	if noEscape {
 		argv = append(argv, "-e", "none")
 	}
 	argv = append(argv, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10")
@@ -415,9 +456,9 @@ func (b *bmcPlatform) sshConsoleArgv(chosen bmcConsole) []string {
 }
 
 // solSession attaches over IPMI SOL. ipmitool runs on the jump host, since IPMI
-// is UDP and the jump host forwards TCP only. release adds sol deactivate
-// around the attach, which drops anyone else on the payload.
-func (b *bmcPlatform) solSession(release bool) ConsoleSession {
+// is UDP and the jump host forwards TCP only. sol deactivate runs around the
+// attach, which drops anyone else on the payload.
+func (b *bmcPlatform) solSession() ConsoleSession {
 	client := ipmi.NewEnvPassword(b.access.IP, b.access.User)
 	session := ConsoleSession{
 		What:        "host console over IPMI SOL at " + b.access.IP,
@@ -425,9 +466,7 @@ func (b *bmcPlatform) solSession(release bool) ConsoleSession {
 		Attach:      b.ipmiArgv(client.SOLActivate(), true),
 		Unreachable: client.Unreachable,
 		NoEscape:    true,
-	}
-	if release {
-		session.Release = b.ipmiArgv(client.SOLDeactivate(), false)
+		Release:     b.ipmiArgv(client.SOLDeactivate(), false),
 	}
 	return session
 }
