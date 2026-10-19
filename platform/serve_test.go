@@ -7,6 +7,7 @@ package platform
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"slices"
@@ -284,7 +285,7 @@ func TestBMCConsoleServeRelaysTheSSHConsole(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- driver.ConsoleServe(ctx, "127.0.0.1:0") }()
+	go func() { done <- driver.ConsoleServe(ctx, "127.0.0.1:0", ConsoleSource{Name: "com1"}) }()
 	waitFor(t, func() bool { return strings.Contains(progress.String(), "Attaching") }, "the attach")
 	cancel()
 	if err := <-done; err != nil {
@@ -305,7 +306,7 @@ func TestBMCConsoleServeReleasesSOLAroundEachAttach(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- driver.ConsoleServe(ctx, "127.0.0.1:0") }()
+	go func() { done <- driver.ConsoleServe(ctx, "127.0.0.1:0", ConsoleSource{Name: "com1"}) }()
 	waitFor(t, func() bool { return strings.Contains(progress.String(), "Attaching") }, "the attach")
 	cancel()
 	if err := <-done; err != nil {
@@ -322,5 +323,38 @@ func TestBMCConsoleServeReleasesSOLAroundEachAttach(t *testing.T) {
 	}
 	if remote := started[0][len(started[0])-1]; !strings.Contains(remote, "sol activate") {
 		t.Errorf("started %q, want sol activate", started[0])
+	}
+}
+
+func TestBMCConsoleServeSOLSourceTakesTheBMCPassed(t *testing.T) {
+	runner := &fakeRunner{}
+	driver, progress := newTestBMC(t, bmcwebSystem("On"), BMCAccess{}, runner)
+	var started [][]string
+	driver.startPiped = func(argv []string) (consoleProcess, error) {
+		started = append(started, argv)
+		return newFakeConsole(), nil
+	}
+	source := ConsoleSource{Name: "sol", BMC: BMC{IP: "192.0.2.9", User: "operator", Password: "secret"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- driver.ConsoleServe(ctx, "127.0.0.1:0", source) }()
+	waitFor(t, func() bool { return strings.Contains(progress.String(), "Attaching") }, "the attach")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(started[0], " ")
+	if !strings.Contains(got, "sol activate") || !strings.Contains(got, "192.0.2.9") || !strings.Contains(got, "operator") {
+		t.Errorf("started %q, want sol activate against the BMC passed", got)
+	}
+	if len(runner.calls) != 2 {
+		t.Errorf("calls = %q, want sol deactivate before the attach and on exit", runner.calls)
+	}
+}
+
+func TestBMCConsoleServeHasNoUART1(t *testing.T) {
+	driver, _ := newTestBMC(t, bmcwebSystem("On"), BMCAccess{}, &fakeRunner{})
+	if err := driver.ConsoleServe(context.Background(), "127.0.0.1:0", ConsoleSource{Name: "uart1"}); !errors.Is(err, ErrNotImplemented) {
+		t.Errorf("ConsoleServe(uart1) = %v, want ErrNotImplemented", err)
 	}
 }

@@ -367,46 +367,60 @@ func (b *bmcPlatform) Console() error {
 	return session.Run(b.runner, b.progress)
 }
 
-// ConsoleServe relays the console the settings and Redfish pick on addr. Over
-// SOL it runs sol deactivate before each attach and on the way out, as the
-// interactive console does, so a payload left open by a dropped session, its
-// own included, never blocks the next attach.
-func (b *bmcPlatform) ConsoleServe(ctx context.Context, addr string) error {
-	if b.configErr != nil {
-		return b.configErr
-	}
-	chosen, err := b.console()
-	if err != nil {
-		return err
-	}
-	var what string
-	var argv []string
-	var release func()
-	if chosen.method == "sol" {
-		session := b.solSession()
-		what, argv = session.What, session.Attach
-		release = func() {
-			fmt.Fprintf(b.progress, "Releasing any open %s...\n", session.What)
-			_, _ = b.runner.Run(session.Release...)
+// ConsoleServe relays a console on addr. com1 is the console the settings and
+// Redfish pick, as Console attaches, and sol is IPMI SOL, as ConsoleSOL
+// attaches. Over SOL it runs sol deactivate before each attach and on the way
+// out, as the interactive console does, so a payload left open by a dropped
+// session, its own included, never blocks the next attach.
+func (b *bmcPlatform) ConsoleServe(ctx context.Context, addr string, source ConsoleSource) error {
+	var session ConsoleSession
+	switch source.Name {
+	case "com1":
+		if b.configErr != nil {
+			return b.configErr
 		}
-	} else {
+		chosen, err := b.console()
+		if err != nil {
+			return err
+		}
+		if chosen.method == "sol" {
+			session = b.solSession()
+			break
+		}
 		if err := b.setenv("SSHPASS", b.access.Password); err != nil {
 			return err
 		}
 		// The relay's client sends bytes rather than keys, so ssh's escape is off.
-		what = "host console over SSH at " + b.access.IP + " port " + strconv.Itoa(chosen.port)
-		argv = b.sshConsoleArgv(chosen, true)
+		session = ConsoleSession{
+			What:   "host console over SSH at " + b.access.IP + " port " + strconv.Itoa(chosen.port),
+			Attach: b.sshConsoleArgv(chosen, true),
+		}
+	case "sol":
+		if err := b.useBMC(source.BMC); err != nil {
+			return err
+		}
+		session = b.solSession()
+	case "uart1":
+		return ErrNotImplemented
+	default:
+		return unknownSource(source.Name)
 	}
-	start := func() (consoleProcess, error) { return b.startPiped(argv) }
-	relay := newConsoleRelay(what, start, b.progress)
-	relay.release = release
-	return relay.serve(ctx, addr)
+	return serveSession(ctx, addr, session, b.startPiped, b.runner, b.progress)
 }
 
 // ConsoleSOL attaches over IPMI SOL whatever the console setting says. The
 // address and credentials come from the same settings as the rest of the
 // driver, and bmc fills any the caller passes.
 func (b *bmcPlatform) ConsoleSOL(bmc BMC) error {
+	if err := b.useBMC(bmc); err != nil {
+		return err
+	}
+	return b.solSession().Run(b.runner, b.progress)
+}
+
+// useBMC takes the address and credentials bmc sets in place of the settings,
+// and checks the result.
+func (b *bmcPlatform) useBMC(bmc BMC) error {
 	if bmc.IP != "" {
 		b.access.IP = bmc.IP
 	}
@@ -416,10 +430,8 @@ func (b *bmcPlatform) ConsoleSOL(bmc BMC) error {
 	if bmc.Password != "" {
 		b.access.Password = bmc.Password
 	}
-	if b.configErr = b.configure(); b.configErr != nil {
-		return b.configErr
-	}
-	return b.solSession().Run(b.runner, b.progress)
+	b.configErr = b.configure()
+	return b.configErr
 }
 
 // sshSession attaches to the BMC's SSH console. The password reaches sshpass in

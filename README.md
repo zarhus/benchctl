@@ -185,6 +185,43 @@ program. Boards without a wired UART1 report the command as not implemented. On
 every platform but `bmc`, `--bmc-ip`, `--bmc-user`, and `--bmc-password` are
 read only with `--source sol`.
 
+### Serving the console
+
+`console --serve <addr>` relays the console `--source` picks on a loopback TCP
+address instead of the terminal, for a test framework that reads the console
+over telnet, such as Robot Framework's `Telnet` library:
+
+```sh
+bin/benchctl console --serve 127.0.0.1:2323
+```
+
+It holds one console session for its whole life, so the console survives client
+reconnects and host resets, and reattaches with a growing backoff when the
+session ends, logging each reattach. It takes one client at a time, and a new
+connection replaces the old one. Output with no client connected is dropped. On
+connect it offers the client `WILL ECHO` and `WILL SUPPRESS-GO-AHEAD`, so a
+telnet client sends each key as it is pressed and the console's own echo is the
+only one. Telnet commands from the client are removed and 0xFF in the output is
+doubled, as telnet expects. The terminal running `--serve` does not echo keys,
+since they reach no console. Once the console has held for two seconds, it
+prints `console-ready` on a line of its own, for a launcher that waits on its
+output. Output alone does not count, since an attach that fails prints its error
+first. SIGINT or SIGTERM ends it.
+
+Each source starts the same way the interactive console attaches to it, and the
+SOL source runs `sol deactivate` before each attach and on the way out, so a
+payload left open by a dropped session never blocks the next attach, and anyone
+else on the payload is dropped:
+
+```sh
+bin/benchctl --host rte.local console --serve 127.0.0.1:2323 --source sol --bmc-ip 192.168.50.11
+```
+
+On `benchrack`, `com1` runs `telnet` to the ser2net port on the RTE. That telnet
+keeps its escape character, so a client that sends `Ctrl+]` reaches the telnet
+prompt on the RTE. On `bmc`, `com1` is the console `console` picks, and `uart1`
+is not implemented. `fvp` reports `--serve` as not implemented.
+
 ## Platforms
 
 | Platform    | Status      | SSH user / default password |
@@ -363,29 +400,8 @@ Like the BenchRack SOL console, it runs `sol deactivate` before and after the
 attach, which drops anyone else on the payload, while the SSH console lets
 several people attach at once.
 
-`console --serve <addr>` relays the same console on a loopback TCP address for a
-test framework that reads the console over telnet, such as Robot Framework's
-`Telnet` library:
-
-```sh
-bin/benchctl console --serve 127.0.0.1:2323
-```
-
-It holds one console session for its whole life, so the console survives client
-reconnects and host resets, and reattaches with a growing backoff when the
-session ends, logging each reattach. It takes one client at a time, and a new
-connection replaces the old one. Output with no client connected is dropped. On
-connect it offers the client `WILL ECHO` and `WILL SUPPRESS-GO-AHEAD`, so a
-telnet client sends each key as it is pressed and the console's own echo is the
-only one. Telnet commands from the client are removed and 0xFF in the output is
-doubled, as telnet expects. The terminal running `--serve` does not echo keys,
-since they reach no console. Once the console has held for two seconds, it
-prints `console-ready` on a line of its own, for a launcher that waits on its
-output. Output alone does not count, since an attach that fails prints its error
-first. SIGINT or SIGTERM ends it. Over SOL it runs `sol deactivate` before each
-attach and on the way out, as the interactive console does, so a payload left
-open by a dropped session never blocks the next attach, and anyone else on the
-payload is dropped. Other platforms report `--serve` as not implemented.
+`console --serve` relays this console, or SOL with `--source sol`, for a test
+framework, as described in [Serving the console](#serving-the-console).
 
 Adding another platform is one package that implements the `Platform` interface
 and registers itself with `platform.Register()` from its `init()`. Drivers can

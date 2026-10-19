@@ -367,10 +367,12 @@ func TestConsoleSourceSOLBMCIPFlagWinsOverEnvVar(t *testing.T) {
 type fakeServer struct {
 	fakePlatform
 	served string
+	source platform.ConsoleSource
 }
 
-func (fake *fakeServer) ConsoleServe(_ context.Context, addr string) error {
+func (fake *fakeServer) ConsoleServe(_ context.Context, addr string, source platform.ConsoleSource) error {
 	fake.served = addr
+	fake.source = source
 	return nil
 }
 
@@ -383,6 +385,9 @@ func TestConsoleServeRelaysOnTheAddress(t *testing.T) {
 	if fake.served != "127.0.0.1:2323" || fake.console {
 		t.Errorf("served %q, attached %v, want only the relay on 127.0.0.1:2323", fake.served, fake.console)
 	}
+	if fake.source.Name != "com1" {
+		t.Errorf("served source %+v, want com1 by default", fake.source)
+	}
 }
 
 func TestConsoleServeIsNotImplementedElsewhere(t *testing.T) {
@@ -392,11 +397,31 @@ func TestConsoleServeIsNotImplementedElsewhere(t *testing.T) {
 	}
 }
 
-func TestConsoleServeRejectsASource(t *testing.T) {
+func TestConsoleServePassesTheSource(t *testing.T) {
+	clearBMCEnv(t)
+	fake := &fakeServer{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "console", "--serve", "127.0.0.1:2323", "--source", "sol", "--bmc-ip", "192.168.50.11"); err != nil {
+		t.Fatal(err)
+	}
+	want := platform.ConsoleSource{Name: "sol", BMC: platform.BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}}
+	if fake.source != want || fake.solBMC != nil {
+		t.Errorf("served source %+v, attached SOL %v, want only the relay of %+v", fake.source, fake.solBMC, want)
+	}
+}
+
+func TestConsoleServeChecksTheSource(t *testing.T) {
+	clearBMCEnv(t)
 	fake := &fakeServer{}
 	withFakePlatform(t, fake)
 	if _, err := run(t, "console", "--serve", "127.0.0.1:2323", "--source", "sol"); err == nil {
-		t.Error("console --serve --source sol should be rejected")
+		t.Error("console --serve --source sol without a BMC address should be rejected")
+	}
+	if _, err := run(t, "console", "--serve", "127.0.0.1:2323", "--source", "com2"); err == nil {
+		t.Error("console --serve --source com2 should be rejected")
+	}
+	if fake.served != "" {
+		t.Errorf("served %q, want no relay for a source that does not resolve", fake.served)
 	}
 }
 

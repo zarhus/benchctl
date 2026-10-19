@@ -5,8 +5,11 @@
 package platform
 
 import (
+	"errors"
 	"io"
 	"strings"
+
+	"github.com/zarhus/benchctl/exec"
 )
 
 // fakeRunner is a test Runner. handler decides each call's output; calls
@@ -29,6 +32,10 @@ type fakeRunner struct {
 	// instead of the fixed interactiveOut/interactiveErr above - for tests
 	// that need a sequence of outcomes (e.g. Console's retry loop).
 	interactiveOutHandler func(call int, out io.Writer, argv []string) error
+	// piped records every argv passed to StartPiped, and startPiped, when set,
+	// returns each one's process.
+	piped      [][]string
+	startPiped func(argv []string) (exec.PipedProcess, error)
 }
 
 func (fake *fakeRunner) Host() string { return fake.host }
@@ -71,6 +78,14 @@ func (fake *fakeRunner) RunInteractiveOut(out io.Writer, argv ...string) error {
 		_, _ = io.WriteString(out, fake.interactiveOut)
 	}
 	return fake.interactiveErr
+}
+
+func (fake *fakeRunner) StartPiped(argv ...string) (exec.PipedProcess, error) {
+	fake.piped = append(fake.piped, argv)
+	if fake.startPiped == nil {
+		return nil, errors.New("fakeRunner: no startPiped")
+	}
+	return fake.startPiped(argv)
 }
 
 func (fake *fakeRunner) Stream(argv ...string) (io.ReadCloser, func() error, error) {

@@ -13,16 +13,29 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/zarhus/benchctl/exec"
 )
 
-// ConsoleServer is a driver that can relay its host console on a TCP port, for
-// a test framework that reads the console over telnet. Drivers implement it
-// where the console needs no terminal of its own. Commands check for it with a
+// ConsoleServer is a driver that can relay a console on a TCP port, for a test
+// framework that reads the console over telnet. Commands check for it with a
 // type assertion.
 type ConsoleServer interface {
-	// ConsoleServe holds the console attached and relays it on addr, a loopback
-	// address, until ctx ends.
-	ConsoleServe(ctx context.Context, addr string) error
+	// ConsoleServe holds source attached and relays it on addr, a loopback
+	// address, until ctx ends. A source the driver cannot relay is
+	// ErrNotImplemented.
+	ConsoleServe(ctx context.Context, addr string, source ConsoleSource) error
+}
+
+// ConsoleSource names the console to relay, as console --source does.
+type ConsoleSource struct {
+	Name string // "com1", "sol" or "uart1"
+	BMC  BMC    // where SOL reaches, for "sol"
+}
+
+// unknownSource reports a source name no console matches.
+func unknownSource(name string) error {
+	return fmt.Errorf("unknown console source %q (want com1, sol, or uart1)", name)
 }
 
 // ConsoleReady is the line the relay prints once the listener is up and the
@@ -31,11 +44,7 @@ const ConsoleReady = "console-ready"
 
 // consoleProcess is a running console attach: its output, its input, and a way
 // to end it.
-type consoleProcess interface {
-	io.ReadWriter
-	Wait() error
-	Stop()
-}
+type consoleProcess = exec.PipedProcess
 
 // consoleRelay holds one console session at a time for its whole life and
 // relays it to one TCP client at a time. A new client replaces the old one,
@@ -72,6 +81,20 @@ func newConsoleRelay(what string, start func() (consoleProcess, error), progress
 		backoffMax: 30 * time.Second,
 		stableFor:  30 * time.Second,
 	}
+}
+
+// serveSession relays session on addr until ctx ends. start runs its Attach,
+// and its Release, when set, runs before each attach and on the way out, so a
+// console left held by a dropped session is free for the next attach.
+func serveSession(ctx context.Context, addr string, session ConsoleSession, start func(argv []string) (consoleProcess, error), runner exec.Runner, progress io.Writer) error {
+	relay := newConsoleRelay(session.What, func() (consoleProcess, error) { return start(session.Attach) }, progress)
+	if len(session.Release) > 0 {
+		relay.release = func() {
+			fmt.Fprintf(progress, "Releasing any open %s...\n", session.What)
+			_, _ = runner.Run(session.Release...)
+		}
+	}
+	return relay.serve(ctx, addr)
 }
 
 // checkLoopback accepts only a loopback listen address, since the relay has no

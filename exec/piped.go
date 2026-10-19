@@ -14,6 +14,14 @@ import (
 	"github.com/creack/pty"
 )
 
+// PipedProcess is a running program whose terminal the caller holds: its
+// output, its input, and a way to end it.
+type PipedProcess interface {
+	io.ReadWriter
+	Wait() error
+	Stop()
+}
+
 // Piped is a local program whose terminal the caller holds, for a console that
 // benchctl relays rather than hands to the local terminal. The program runs on
 // a pseudo-terminal of its own, so ipmitool and telnet find a terminal to put

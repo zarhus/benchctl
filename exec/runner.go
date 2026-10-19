@@ -61,6 +61,10 @@ type Runner interface {
 	// which returns the command's exit error (including stderr) or nil. Used for
 	// long commands that report progress as they run.
 	Stream(argv ...string) (stdout io.ReadCloser, wait func() error, err error)
+	// StartPiped starts argv on the bench on a terminal the caller holds instead
+	// of the local one, with the SSH client's own escape character disabled. Used
+	// for a console that benchctl relays.
+	StartPiped(argv ...string) (PipedProcess, error)
 	// Push copies localPath to remotePath on the bench and returns the path to
 	// use there plus a cleanup function that removes it. When the target is local
 	// it is a no-op that returns localPath (remotePath is ignored) and a cleanup
@@ -317,6 +321,16 @@ func (runner *CmdRunner) interactiveErr(err error) error {
 		return unreachable
 	}
 	return err
+}
+
+func (runner *CmdRunner) StartPiped(argv ...string) (PipedProcess, error) {
+	full := runner.commandArgv(argv, remoteTTYNoEscape)
+	runner.trace(full)
+	piped, err := StartPiped(full)
+	if err != nil {
+		return nil, err
+	}
+	return piped, nil
 }
 
 func (runner *CmdRunner) Stream(argv ...string) (io.ReadCloser, func() error, error) {

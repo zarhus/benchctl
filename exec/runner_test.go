@@ -397,3 +397,15 @@ func TestStartPipedStopReachesChildren(t *testing.T) {
 		t.Fatal("Stop left the program running")
 	}
 }
+
+func TestCmdRunnerStartPipedRunsLocally(t *testing.T) {
+	runner := &CmdRunner{Target: Target{Host: "localhost"}}
+	piped, err := runner.StartPiped("sh", "-c", "test -t 0 && echo on-a-terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(piped)
+	if err := piped.Wait(); err != nil || !strings.Contains(string(out), "on-a-terminal") {
+		t.Errorf("read %q, Wait = %v, want the program run locally on a terminal", out, err)
+	}
+}

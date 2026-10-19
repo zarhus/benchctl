@@ -5,6 +5,7 @@
 package platform
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -408,12 +409,53 @@ func (bench *benchRack) Console() error {
 	if err := bench.ensureIdle(); err != nil {
 		return err
 	}
+	return bench.com1Session().Run(bench.runner, bench.progress)
+}
+
+// com1Session is the COM1 console: telnet to the ser2net port on the RTE.
+func (bench *benchRack) com1Session() ConsoleSession {
 	port := strconv.Itoa(bench.board.console.port)
 	return ConsoleSession{
 		What:   "host console via telnet on port " + port,
 		Detach: `CTRL+] then "quit"`,
 		Attach: []string{"telnet", "localhost", port},
-	}.Run(bench.runner, bench.progress)
+	}
+}
+
+// ConsoleServe relays a console on addr: com1, sol, or uart1, each started on
+// the RTE as console attaches it. The telnet behind com1 keeps its own escape
+// character, Ctrl+], so a client that sends that byte reaches the telnet prompt
+// on the RTE.
+func (bench *benchRack) ConsoleServe(ctx context.Context, addr string, source ConsoleSource) error {
+	if bench.boardErr != nil {
+		return bench.boardErr
+	}
+	// Reject a call the driver cannot act on before parking, so it leaves the
+	// bench untouched.
+	if err := checkLoopback(addr); err != nil {
+		return err
+	}
+	var session ConsoleSession
+	switch source.Name {
+	case "com1":
+		session = bench.com1Session()
+	case "sol":
+		if source.BMC.IP == "" {
+			return fmt.Errorf("no BMC address for the SOL console")
+		}
+		session = rteSOLSession(source.BMC)
+	case "uart1":
+		if bench.board.console.uart1Device == "" {
+			return ErrNotImplemented
+		}
+		session = bench.uart1Session()
+	default:
+		return unknownSource(source.Name)
+	}
+	if err := bench.ensureIdle(); err != nil {
+		return err
+	}
+	return serveSession(ctx, addr, session, bench.startPiped, bench.runner, bench.progress)
 }
 
 // ConsoleSOL attaches to the host console over the BMC's IPMI serial-over-LAN
@@ -432,6 +474,12 @@ func (bench *benchRack) ConsoleSOL(bmc BMC) error {
 	if err := bench.ensureIdle(); err != nil {
 		return err
 	}
+	return rteSOLSession(bmc).Run(bench.runner, bench.progress)
+}
+
+// rteSOLSession is the host console over bmc's IPMI SOL payload, with ipmitool
+// on the RTE.
+func rteSOLSession(bmc BMC) ConsoleSession {
 	client := ipmi.New(bmc.IP, bmc.User, bmc.Password)
 	return ConsoleSession{
 		What:   "host console over IPMI SOL at " + bmc.IP,
@@ -446,7 +494,7 @@ func (bench *benchRack) ConsoleSOL(bmc BMC) error {
 		Unreachable: client.Unreachable,
 		// The session ends on "~.", which ssh would otherwise take for itself.
 		NoEscape: true,
-	}.Run(bench.runner, bench.progress)
+	}
 }
 
 // ConsoleUART1 attaches, read-only, to a second debug UART some boards wire to
@@ -464,6 +512,11 @@ func (bench *benchRack) ConsoleUART1() error {
 	if err := bench.ensureIdle(); err != nil {
 		return err
 	}
+	return bench.uart1Session().Run(bench.runner, bench.progress)
+}
+
+// uart1Session is the read-only UART1 console: cat of the device on the RTE.
+func (bench *benchRack) uart1Session() ConsoleSession {
 	device := bench.board.console.uart1Device
 	baud := strconv.Itoa(bench.board.console.uart1Baud)
 	// The line starts in canonical mode, which would mangle control bytes in the
@@ -484,7 +537,12 @@ func (bench *benchRack) ConsoleUART1() error {
 		What:   "UART1 firmware console (read-only) on " + device,
 		Detach: "Ctrl+C",
 		Attach: []string{"sh", "-c", script},
-	}.Run(bench.runner, bench.progress)
+	}
+}
+
+// startPiped starts argv on the RTE for the relay.
+func (bench *benchRack) startPiped(argv []string) (consoleProcess, error) {
+	return bench.runner.StartPiped(argv...)
 }
 
 // withFlashBus parks the bus, powers the board off so the RTE drives the flash,

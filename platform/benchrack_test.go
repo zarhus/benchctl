@@ -5,6 +5,7 @@
 package platform
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zarhus/benchctl/exec"
 	"github.com/zarhus/benchctl/internal/rte"
 )
 
@@ -316,6 +318,94 @@ func TestBenchRackConsoleTelnetsToSer2net(t *testing.T) {
 	got := strings.Join(runner.interactive[0], " ")
 	if !strings.Contains(got, "telnet") || !strings.Contains(got, strconv.Itoa(b.board.console.port)) {
 		t.Errorf("console argv = %q, want telnet against the ser2net port", got)
+	}
+}
+
+func TestBenchRackConsoleServeRelaysTelnetToSer2net(t *testing.T) {
+	console := newFakeConsole()
+	runner := &fakeRunner{startPiped: func([]string) (exec.PipedProcess, error) { return console, nil }}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	progress := &syncWriter{}
+	b.progress = progress
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.ConsoleServe(ctx, "127.0.0.1:0", ConsoleSource{Name: "com1"}) }()
+	waitFor(t, func() bool { return strings.Contains(progress.String(), "Attaching") }, "the attach")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	want := "telnet localhost " + strconv.Itoa(b.board.console.port)
+	if len(runner.piped) != 1 || strings.Join(runner.piped[0], " ") != want {
+		t.Errorf("started %q, want one %q", runner.piped, want)
+	}
+}
+
+func TestBenchRackConsoleServeRejectsAnOpenAddressBeforeParking(t *testing.T) {
+	runner := &fakeRunner{}
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	if err := b.ConsoleServe(context.Background(), "0.0.0.0:2323", ConsoleSource{Name: "com1"}); err == nil {
+		t.Fatal("ConsoleServe accepted a non-loopback address")
+	}
+	if g := b.gpio.(*fakeGPIO); len(g.sets) != 0 || len(runner.piped) != 0 {
+		t.Errorf("ConsoleServe set %v and started %q, want the bench untouched", g.sets, runner.piped)
+	}
+}
+
+// serveBenchRack runs ConsoleServe for source until it attaches, then stops it,
+// and returns what it started on the RTE.
+func serveBenchRack(t *testing.T, runner *fakeRunner, source ConsoleSource) [][]string {
+	t.Helper()
+	runner.startPiped = func([]string) (exec.PipedProcess, error) { return newFakeConsole(), nil }
+	b := testBenchRack(t, runner, &fakeGPIO{})
+	progress := &syncWriter{}
+	b.progress = progress
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.ConsoleServe(ctx, "127.0.0.1:0", source) }()
+	waitFor(t, func() bool { return strings.Contains(progress.String(), "Attaching") }, "the attach")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	return runner.piped
+}
+
+func TestBenchRackConsoleServeSOLReleasesAroundTheAttach(t *testing.T) {
+	runner := &fakeRunner{}
+	bmc := BMC{IP: "192.168.50.11", User: "admin", Password: "Administrator"}
+	started := serveBenchRack(t, runner, ConsoleSource{Name: "sol", BMC: bmc})
+	if len(started) != 1 || !strings.Contains(strings.Join(started[0], " "), "sol activate") {
+		t.Errorf("started %q, want one sol activate", started)
+	}
+	var releases int
+	for _, call := range runner.calls {
+		if strings.Contains(strings.Join(call, " "), "sol deactivate") {
+			releases++
+		}
+	}
+	if releases != 2 {
+		t.Errorf("calls = %q, want sol deactivate before the attach and on exit", runner.calls)
+	}
+}
+
+func TestBenchRackConsoleServeUART1CatsTheDevice(t *testing.T) {
+	started := serveBenchRack(t, &fakeRunner{}, ConsoleSource{Name: "uart1"})
+	if len(started) != 1 || !strings.Contains(strings.Join(started[0], " "), "cat /dev/ttyUSB0") {
+		t.Errorf("started %q, want one cat of the UART1 device", started)
+	}
+}
+
+func TestBenchRackConsoleServeChecksTheSourceBeforeParking(t *testing.T) {
+	for _, source := range []ConsoleSource{{Name: "sol"}, {Name: "com2"}} {
+		runner := &fakeRunner{}
+		b := testBenchRack(t, runner, &fakeGPIO{})
+		if err := b.ConsoleServe(context.Background(), "127.0.0.1:0", source); err == nil {
+			t.Errorf("ConsoleServe(%+v) = nil, want an error", source)
+		}
+		if g := b.gpio.(*fakeGPIO); len(g.sets) != 0 || len(runner.piped) != 0 {
+			t.Errorf("ConsoleServe(%+v) set %v and started %q, want the bench untouched", source, g.sets, runner.piped)
+		}
 	}
 }
 
