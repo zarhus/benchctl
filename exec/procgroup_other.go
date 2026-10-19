@@ -17,3 +17,6 @@ func stopProcessGroup(process *os.Process) {
 
 // followResize does nothing where there is no SIGWINCH.
 func followResize(_, _ *os.File) func() { return func() {} }
+
+// pollable returns file as it is.
+func pollable(file *os.File) *os.File { return file }

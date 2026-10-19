@@ -451,6 +451,10 @@ func (b *bmcPlatform) sshSession(chosen bmcConsole) (ConsoleSession, error) {
 // sshConsoleArgv builds the ssh command for the BMC's console. noEscape
 // disables ssh's escape, so "~" reaches the console: the runner's detach key or
 // the relay ends the session instead. Otherwise ssh's "~." is the way out.
+//
+// The jump host is crossed with "ssh -W" as the ProxyCommand, the way Redfish
+// requests cross it, so the connection to the jump host has the same
+// ConnectTimeout as the one to the BMC, and only the BMC gets the password.
 func (b *bmcPlatform) sshConsoleArgv(chosen bmcConsole, noEscape bool) []string {
 	argv := []string{"sshpass", "-e", "ssh", "-tt"}
 	if noEscape {
@@ -458,7 +462,9 @@ func (b *bmcPlatform) sshConsoleArgv(chosen bmcConsole, noEscape bool) []string 
 	}
 	argv = append(argv, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10")
 	if b.access.Jump != "" {
-		argv = append(argv, "-J", b.access.Jump)
+		// ssh expands %h and %p, and runs the command with the shell.
+		jump := strings.ReplaceAll(exec.ShellJoin([]string{b.access.Jump}), "%", "%%")
+		argv = append(argv, "-o", "ProxyCommand=ssh -o BatchMode=yes -o ConnectTimeout=10 -W '[%h]:%p' "+jump)
 	}
 	argv = append(argv, "-p", strconv.Itoa(chosen.port), "-l", b.access.User, b.access.IP)
 	if chosen.entry != "" {

@@ -16,6 +16,27 @@ import (
 	"github.com/zarhus/benchctl/platform"
 )
 
+// serveContext returns a context that SIGINT or SIGTERM ends, for console
+// --serve to release the console and exit. A second signal restores the
+// terminal with restoreEcho and exits at once, for a release that hangs.
+func serveContext(restoreEcho func()) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signals
+		cancel()
+		<-signals
+		restoreEcho()
+		fmt.Fprintln(os.Stderr, "benchctl: interrupted again, exiting without releasing the console")
+		os.Exit(1)
+	}()
+	return ctx, func() {
+		signal.Stop(signals)
+		cancel()
+	}
+}
+
 func consoleCmd() *cobra.Command {
 	var source, serve string
 
@@ -74,10 +95,11 @@ at the start of a line for sol, Ctrl+C for uart1.`,
 					if !ok {
 						return platform.ErrNotImplemented
 					}
-					ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-					defer stop()
 					// Keys pressed here reach no console, so the terminal does not echo them.
-					defer exec.NoEcho(os.Stdin)()
+					restoreEcho := exec.NoEcho(os.Stdin)
+					defer restoreEcho()
+					ctx, stop := serveContext(restoreEcho)
+					defer stop()
 					return server.ConsoleServe(ctx, serve, chosen)
 				}
 				switch source {

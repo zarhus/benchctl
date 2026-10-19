@@ -198,15 +198,19 @@ bin/benchctl console --serve 127.0.0.1:2323
 It holds one console session for its whole life, so the console survives client
 reconnects and host resets, and reattaches with a growing backoff when the
 session ends, logging each reattach. It takes one client at a time, and a new
-connection replaces the old one. Output with no client connected is dropped. On
+connection replaces the old one. Output with no client connected is dropped.
+Once a client leaves output unread for two seconds, the output is dropped as it
+arrives until the client reads again, so the console runs at its own pace. On
 connect it offers the client `WILL ECHO` and `WILL SUPPRESS-GO-AHEAD`, so a
 telnet client sends each key as it is pressed and the console's own echo is the
 only one. Telnet commands from the client are removed and 0xFF in the output is
 doubled, as telnet expects. The terminal running `--serve` does not echo keys,
-since they reach no console. Once the console has held for two seconds, it
-prints `console-ready` on a line of its own, for a launcher that waits on its
-output. Output alone does not count, since an attach that fails prints its error
-first. SIGINT or SIGTERM ends it.
+since they reach no console. Once the console has held for two seconds after its
+first output, or for twelve seconds with no output, which is longer than the
+ten-second connect timeout of each ssh hop, it prints `console-ready` on a line
+of its own, for a launcher that waits on its output. An attach that fails prints
+its error and exits before then. SIGINT or SIGTERM ends it, and a second one
+ends it at once, without waiting for the release.
 
 Each source starts the same way the interactive console attaches to it, and the
 SOL source runs `sol deactivate` before each attach and on the way out, so a
@@ -216,6 +220,9 @@ else on the payload is dropped:
 ```sh
 bin/benchctl --host rte.local console --serve 127.0.0.1:2323 --source sol --bmc-ip 192.168.50.11
 ```
+
+A `sol deactivate` that gets no answer from the BMC ends the session before the
+attach, as a failed attach does.
 
 On `benchrack`, `com1` runs `telnet` to the ser2net port on the RTE. That telnet
 keeps its escape character, so a client that sends `Ctrl+]` reaches the telnet
@@ -373,8 +380,9 @@ The jump host is an ssh destination, best a `Host` entry in `~/.ssh/config`,
 which supplies its user, keys and any further hops. It has to accept your key,
 since the password prompt `sshpass` answers belongs to the BMC. Redfish
 connections cross it with `ssh -W <bmc>:443`, one per request, and the SSH
-console with `ssh -J`. The BMC's host key is recorded on first use
-(`StrictHostKeyChecking=accept-new`).
+console with `ssh -W` as its `ProxyCommand`. Both connect to the jump host with
+a ten-second timeout and `BatchMode=yes`. The BMC's host key is recorded on
+first use (`StrictHostKeyChecking=accept-new`).
 
 Power maps onto `ComputerSystem.Reset`: `power on` sends `On`, `power off` sends
 `ForceOff`, `power reset` sends `ForceRestart`, or `PowerCycle` where the BMC

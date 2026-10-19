@@ -398,6 +398,50 @@ func TestStartPipedStopReachesChildren(t *testing.T) {
 	}
 }
 
+func TestStartPipedReadEndsWhenTheProgramLeavesAProcessBehind(t *testing.T) {
+	// The sleep ignores the hangup the shell's exit sends, and holds the
+	// terminal open after the shell exits.
+	piped, err := StartPiped([]string{"sh", "-c", "trap \"\" HUP TERM; sleep 3 & echo started"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan []byte)
+	go func() {
+		out, _ := io.ReadAll(piped)
+		done <- out
+	}()
+	select {
+	case out := <-done:
+		if !strings.Contains(string(out), "started") {
+			t.Errorf("read %q, want the program's output", out)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read did not end after the program exited")
+	}
+	if err := piped.Wait(); err != nil {
+		t.Errorf("Wait = %v", err)
+	}
+}
+
+func TestStartPipedTerminalStaysOutOfLaterPrograms(t *testing.T) {
+	piped, err := StartPiped([]string{"sleep", "30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		piped.Stop()
+		_, _ = io.ReadAll(piped)
+		_ = piped.Wait()
+	}()
+	out, err := osexec.Command("ls", "-l", "/proc/self/fd").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "ptmx") {
+		t.Errorf("a later program holds the terminal:\n%s", out)
+	}
+}
+
 func TestCmdRunnerStartPipedRunsLocally(t *testing.T) {
 	runner := &CmdRunner{Target: Target{Host: "localhost"}}
 	piped, err := runner.StartPiped("sh", "-c", "test -t 0 && echo on-a-terminal")

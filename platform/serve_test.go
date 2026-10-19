@@ -10,9 +10,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -92,6 +94,8 @@ func startRelay(t *testing.T, consoles chan *fakeConsole) (string, *syncWriter) 
 	log := &syncWriter{}
 	relay := newConsoleRelay("test console", func() (consoleProcess, error) { return <-consoles, nil }, log)
 	relay.readyAfter = time.Hour
+	relay.quietReadyAfter = time.Hour
+	relay.writeTimeout = 50 * time.Millisecond
 	relay.backoffMin = time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -234,19 +238,196 @@ func TestRelayDropsOutputWithNoClient(t *testing.T) {
 	}
 }
 
-func TestRelayPrintsReadyOnceTheConsoleHolds(t *testing.T) {
+// serveForReady serves a relay on console with the given ready times and returns
+// its log and a function that ends it.
+func serveForReady(t *testing.T, consoles chan *fakeConsole, readyAfter, quietReadyAfter time.Duration) (*syncWriter, func()) {
+	t.Helper()
 	log := &syncWriter{}
-	console := newFakeConsole()
-	relay := newConsoleRelay("test console", func() (consoleProcess, error) { return console, nil }, log)
-	relay.readyAfter = time.Millisecond
+	relay := newConsoleRelay("test console", func() (consoleProcess, error) { return <-consoles, nil }, log)
+	relay.readyAfter = readyAfter
+	relay.quietReadyAfter = quietReadyAfter
+	relay.backoffMin = time.Hour
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- relay.serve(ctx, "127.0.0.1:0") }()
+	return log, func() {
+		cancel()
+		<-done
+	}
+}
+
+func TestRelayPrintsReadyOnceTheConsoleHolds(t *testing.T) {
+	consoles := make(chan *fakeConsole, 1)
+	console := newFakeConsole()
+	consoles <- console
+	log, stop := serveForReady(t, consoles, time.Millisecond, time.Hour)
+	go func() { _, _ = console.console.Write([]byte("login: ")) }()
 	waitFor(t, func() bool { return strings.Contains(log.String(), ConsoleReady) }, ConsoleReady)
-	cancel()
-	<-done
+	stop()
 	if n := strings.Count(log.String(), ConsoleReady); n != 1 {
 		t.Errorf("log = %q, want %s once", log, ConsoleReady)
+	}
+}
+
+func TestRelayPrintsReadyOnAQuietConsoleThatHolds(t *testing.T) {
+	consoles := make(chan *fakeConsole, 1)
+	consoles <- newFakeConsole()
+	log, stop := serveForReady(t, consoles, time.Hour, time.Millisecond)
+	defer stop()
+	waitFor(t, func() bool { return strings.Contains(log.String(), ConsoleReady) }, ConsoleReady)
+}
+
+func TestRelayIsNotReadyOnASlowFailedAttach(t *testing.T) {
+	consoles := make(chan *fakeConsole, 1)
+	console := newFakeConsole()
+	consoles <- console
+	log, stop := serveForReady(t, consoles, 50*time.Millisecond, time.Hour)
+	defer stop()
+	// The attach is silent while it connects, then fails.
+	time.Sleep(100 * time.Millisecond)
+	_, _ = console.console.Write([]byte("ssh: connect to host 192.0.2.1 port 2200: Connection timed out\r\n"))
+	console.Stop()
+	waitFor(t, func() bool { return strings.Contains(log.String(), "ended") }, "the attach to end")
+	time.Sleep(100 * time.Millisecond)
+	if strings.Contains(log.String(), ConsoleReady) {
+		t.Errorf("log = %q, want no %s from an attach that failed", log, ConsoleReady)
+	}
+}
+
+func TestRelayReleasesWhenCancelledBetweenAttaches(t *testing.T) {
+	consoles := make(chan *fakeConsole, 1)
+	console := newFakeConsole()
+	consoles <- console
+	log := &syncWriter{}
+	relay := newConsoleRelay("test console", func() (consoleProcess, error) { return <-consoles, nil }, log)
+	var releases atomic.Int32
+	relay.release = func() error {
+		releases.Add(1)
+		return nil
+	}
+	relay.backoffMin = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- relay.serve(ctx, "127.0.0.1:0") }()
+	waitFor(t, func() bool { return strings.Contains(log.String(), "Attaching") }, "the attach")
+	console.Stop()
+	waitFor(t, func() bool { return strings.Contains(log.String(), "reattaching") }, "the backoff")
+	cancel()
+	<-done
+	// One release before the attach, one on the way out.
+	if n := releases.Load(); n != 2 {
+		t.Errorf("releases = %d, want 2", n)
+	}
+}
+
+func TestRelaySkipsTheAttachWhenCancelledDuringTheRelease(t *testing.T) {
+	log := &syncWriter{}
+	var starts atomic.Int32
+	relay := newConsoleRelay("test console", func() (consoleProcess, error) {
+		starts.Add(1)
+		return newFakeConsole(), nil
+	}, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	relay.release = func() error {
+		cancel()
+		return nil
+	}
+	if err := relay.serve(ctx, "127.0.0.1:0"); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if n := starts.Load(); n != 0 {
+		t.Errorf("attaches = %d, want 0", n)
+	}
+	if strings.Contains(log.String(), "Attaching") {
+		t.Errorf("log names an attach after the cancel:\n%s", log.String())
+	}
+}
+
+func TestRelayServesPastAClientThatStopsReading(t *testing.T) {
+	consoles := make(chan *fakeConsole, 1)
+	console := newFakeConsole()
+	consoles <- console
+	addr, log := startRelay(t, consoles)
+	stuck := dial(t, addr)
+	defer stuck.Close()
+	waitFor(t, func() bool { return strings.Contains(log.String(), "connected") }, "the client")
+	// More output than the socket buffers hold, which the client never reads.
+	go func() {
+		chunk := bytes.Repeat([]byte("x"), 64<<10)
+		for {
+			if _, err := console.console.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	waitFor(t, func() bool { return strings.Contains(log.String(), "not reading") }, "the stalled client")
+	next := dial(t, addr)
+	waitFor(t, func() bool { return strings.Contains(log.String(), "replaces") }, "the next client")
+	if got := readN(t, next, 1); string(got) != "x" {
+		t.Errorf("next client read %q, want console output", got)
+	}
+}
+
+func TestRelayDropsOutputAtOnceWhileTheClientIsStalled(t *testing.T) {
+	consoles := make(chan *fakeConsole, 1)
+	console := newFakeConsole()
+	consoles <- console
+	addr, log := startRelay(t, consoles)
+	stuck := dial(t, addr)
+	defer stuck.Close()
+	waitFor(t, func() bool { return strings.Contains(log.String(), "connected") }, "the client")
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	go func() {
+		for !strings.Contains(log.String(), "not reading") {
+			if _, err := console.console.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	waitFor(t, func() bool { return strings.Contains(log.String(), "not reading") }, "the stalled client")
+	// 1 MiB is 256 reads of 4 KiB. A write that waited writeTimeout on each
+	// read would take about 13 seconds.
+	started := time.Now()
+	for range 16 {
+		if _, err := console.console.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if took := time.Since(started); took > 2*time.Second {
+		t.Errorf("1 MiB of console output took %s with a stalled client, want it dropped at once", took)
+	}
+}
+
+// cutConn is a client whose writes each take at most n bytes and then time out.
+type cutConn struct {
+	net.Conn
+	n   int
+	got []byte
+}
+
+func (c *cutConn) Write(p []byte) (int, error) {
+	n := min(c.n, len(p))
+	c.got = append(c.got, p[:n]...)
+	if n < len(p) {
+		return n, os.ErrDeadlineExceeded
+	}
+	return n, nil
+}
+
+func (c *cutConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *cutConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+
+func TestRelayCompletesAnEscapedIACCutByTheDeadline(t *testing.T) {
+	relay := newConsoleRelay("test console", nil, io.Discard)
+	client := &cutConn{n: 2}
+	relay.client = client
+	// The cut falls between the two bytes of the escaped 0xFF, and the rest of
+	// the first write is dropped.
+	relay.toClient(escapeIAC([]byte("a\xffbc")))
+	client.n = 100
+	relay.toClient(escapeIAC([]byte("d")))
+	if want := "a\xff\xffd"; string(client.got) != want {
+		t.Errorf("client got %q, want %q", client.got, want)
 	}
 }
 
@@ -323,6 +504,29 @@ func TestBMCConsoleServeReleasesSOLAroundEachAttach(t *testing.T) {
 	}
 	if remote := started[0][len(started[0])-1]; !strings.Contains(remote, "sol activate") {
 		t.Errorf("started %q, want sol activate", started[0])
+	}
+}
+
+func TestBMCConsoleServeSkipsTheAttachWhenTheBMCDoesNotAnswer(t *testing.T) {
+	runner := &fakeRunner{handler: func(int, []string) (string, error) {
+		return "", errors.New("exit status 1: Error: Unable to establish IPMI v2 / RMCP+ session")
+	}}
+	driver, progress := newTestBMC(t, bmcwebSystem("On"), BMCAccess{Console: "sol", Jump: "jumphost"}, runner)
+	var started atomic.Int32
+	driver.startPiped = func([]string) (consoleProcess, error) {
+		started.Add(1)
+		return newFakeConsole(), nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- driver.ConsoleServe(ctx, "127.0.0.1:0", ConsoleSource{Name: "com1"}) }()
+	waitFor(t, func() bool { return strings.Contains(progress.String(), "cannot reach BMC") }, "the failed release")
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n := started.Load(); n != 0 {
+		t.Errorf("attaches = %d, want none while the BMC does not answer", n)
 	}
 }
 

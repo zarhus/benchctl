@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -27,26 +28,39 @@ type PipedProcess interface {
 // a pseudo-terminal of its own, so ipmitool and telnet find a terminal to put
 // into raw mode, and its output, standard error included, comes from Read.
 type Piped struct {
-	cmd  *exec.Cmd
-	ptmx *os.File
+	cmd    *exec.Cmd
+	ptmx   *os.File
+	exited chan struct{} // closed once the program has exited
+	err    error         // the program's exit, set before exited closes
 }
 
 // StartPiped starts argv locally, leading a session of its own, so Stop
-// reaches everything it starts, such as ssh behind sshpass.
+// reaches everything it starts, such as ssh behind sshpass. Once the program
+// exits, its output gets outputDrain to arrive, and then its terminal closes,
+// which ends Read even while a process it left behind holds the terminal open.
 func StartPiped(argv []string) (*Piped, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return nil, err
 	}
-	return &Piped{cmd: cmd, ptmx: ptmx}, nil
+	ptmx = pollable(ptmx)
+	piped := &Piped{cmd: cmd, ptmx: ptmx, exited: make(chan struct{})}
+	go func() {
+		piped.err = cmd.Wait()
+		close(piped.exited)
+		time.Sleep(outputDrain)
+		ptmx.Close()
+	}()
+	return piped, nil
 }
 
 // Read reads the program's output. The terminal reports EIO once the program
-// and everything it started have closed it, which Read reports as io.EOF.
+// and everything it started have closed it, which Read reports as io.EOF, as it
+// does a read from the terminal closed after the program exited.
 func (piped *Piped) Read(p []byte) (int, error) {
 	n, err := piped.ptmx.Read(p)
-	if err != nil && errors.Is(err, syscall.EIO) {
+	if err != nil && (errors.Is(err, syscall.EIO) || errors.Is(err, os.ErrClosed)) {
 		err = io.EOF
 	}
 	return n, err
@@ -55,12 +69,11 @@ func (piped *Piped) Read(p []byte) (int, error) {
 // Write types p into the program's terminal.
 func (piped *Piped) Write(p []byte) (int, error) { return piped.ptmx.Write(p) }
 
-// Wait waits for the program to exit and closes its terminal. The caller reads
-// its output to the end first.
+// Wait waits for the program to exit and returns how it exited. The caller
+// reads its output to the end first.
 func (piped *Piped) Wait() error {
-	err := piped.cmd.Wait()
-	piped.ptmx.Close()
-	return err
+	<-piped.exited
+	return piped.err
 }
 
 // Stop sends SIGTERM to the program's process group.

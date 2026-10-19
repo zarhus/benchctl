@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -55,31 +56,48 @@ type consoleRelay struct {
 	start    func() (consoleProcess, error)
 	progress io.Writer
 	// release, when set, frees the console before each attach and after the
-	// last one, for a console that admits one session at a time.
-	release func()
+	// last one, for a console that admits one session at a time. An error from
+	// it before an attach says the console cannot be reached, and the session
+	// ends without attaching.
+	release func() error
 
-	// readyAfter is how long a session has to hold before ConsoleReady. Output
-	// alone does not count, since an attach that fails prints its error.
-	readyAfter time.Duration
-	backoffMin time.Duration // first wait before reattaching
-	backoffMax time.Duration
-	stableFor  time.Duration // a session that held this long resets the backoff
+	// readyAfter is how long a session has to hold after its first output before
+	// ConsoleReady, and quietReadyAfter how long it has to hold with no output.
+	// An attach that fails prints its error and exits within readyAfter, and
+	// quietReadyAfter is longer than the attach commands' ssh ConnectTimeout, so
+	// an attach that is still connecting is not ready either.
+	readyAfter      time.Duration
+	quietReadyAfter time.Duration
+	// writeTimeout is how long a write to the client may block. Output the
+	// client does not take within it is dropped, as with no client connected.
+	// While the client takes nothing, each write waits stalledWriteTimeout, so
+	// the console output goes on at its own pace.
+	writeTimeout time.Duration
+	backoffMin   time.Duration // first wait before reattaching
+	backoffMax   time.Duration
+	stableFor    time.Duration // a session that held this long resets the backoff
 
 	mu        sync.Mutex
 	client    net.Conn
 	proc      consoleProcess
 	readyOnce sync.Once
+	// Used by pump only: the client whose last write timed out, and the client
+	// whose last write ended between the two bytes of an escaped 0xFF.
+	stalled net.Conn
+	openIAC net.Conn
 }
 
 func newConsoleRelay(what string, start func() (consoleProcess, error), progress io.Writer) *consoleRelay {
 	return &consoleRelay{
-		what:       what,
-		start:      start,
-		progress:   progress,
-		readyAfter: 2 * time.Second,
-		backoffMin: time.Second,
-		backoffMax: 30 * time.Second,
-		stableFor:  30 * time.Second,
+		what:            what,
+		start:           start,
+		progress:        progress,
+		readyAfter:      2 * time.Second,
+		quietReadyAfter: 12 * time.Second,
+		writeTimeout:    2 * time.Second,
+		backoffMin:      time.Second,
+		backoffMax:      30 * time.Second,
+		stableFor:       30 * time.Second,
 	}
 }
 
@@ -89,9 +107,16 @@ func newConsoleRelay(what string, start func() (consoleProcess, error), progress
 func serveSession(ctx context.Context, addr string, session ConsoleSession, start func(argv []string) (consoleProcess, error), runner exec.Runner, progress io.Writer) error {
 	relay := newConsoleRelay(session.What, func() (consoleProcess, error) { return start(session.Attach) }, progress)
 	if len(session.Release) > 0 {
-		relay.release = func() {
+		relay.release = func() error {
 			fmt.Fprintf(progress, "Releasing any open %s...\n", session.What)
-			_, _ = runner.Run(session.Release...)
+			out, err := runner.Run(session.Release...)
+			if benchUnreachable(err) {
+				return err
+			}
+			if session.Unreachable != nil {
+				return session.Unreachable(out, err)
+			}
+			return nil
 		}
 	}
 	return relay.serve(ctx, addr)
@@ -122,10 +147,20 @@ func (relay *consoleRelay) serve(ctx context.Context, addr string) error {
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
 	fmt.Fprintf(relay.progress, "Serving %s on %s.\n", relay.what, listener.Addr())
-	go relay.accept(listener)
-	defer relay.dropClient()
+	accepting := make(chan struct{})
+	go func() {
+		relay.accept(listener)
+		close(accepting)
+	}()
+	defer func() {
+		listener.Close()
+		<-accepting
+		relay.dropClient()
+		if relay.release != nil {
+			_ = relay.release()
+		}
+	}()
 
 	backoff := relay.backoffMin
 	for {
@@ -150,7 +185,13 @@ func (relay *consoleRelay) serve(ctx context.Context, addr string) error {
 // session runs one console attach until it ends or ctx does.
 func (relay *consoleRelay) session(ctx context.Context) error {
 	if relay.release != nil {
-		relay.release()
+		if err := relay.release(); err != nil {
+			return err
+		}
+		// A cancel during the release ends the session before the attach.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	proc, err := relay.start()
 	if err != nil {
@@ -165,12 +206,12 @@ func (relay *consoleRelay) session(ctx context.Context) error {
 		relay.mu.Unlock()
 	}()
 	fmt.Fprintf(relay.progress, "Attaching to the %s.\n", relay.what)
-	readyTimer := time.AfterFunc(relay.readyAfter, relay.markReady)
+	readyTimer := time.AfterFunc(relay.quietReadyAfter, relay.markReady)
 	defer readyTimer.Stop()
 
 	done := make(chan error, 1)
 	go func() {
-		relay.pump(proc)
+		relay.pump(proc, readyTimer)
 		done <- proc.Wait()
 	}()
 	select {
@@ -182,9 +223,6 @@ func (relay *consoleRelay) session(ctx context.Context) error {
 	case <-ctx.Done():
 		proc.Stop()
 		<-done
-		if relay.release != nil {
-			relay.release()
-		}
 		return nil
 	}
 }
@@ -194,12 +232,18 @@ func (relay *consoleRelay) markReady() {
 	relay.readyOnce.Do(func() { fmt.Fprintln(relay.progress, ConsoleReady) })
 }
 
-// pump copies console output to the client, until the console ends.
-func (relay *consoleRelay) pump(proc consoleProcess) {
+// pump copies console output to the client, until the console ends. The first
+// output moves readyTimer to readyAfter.
+func (relay *consoleRelay) pump(proc consoleProcess, readyTimer *time.Timer) {
 	buf := make([]byte, 4096)
+	seen := false
 	for {
 		n, err := proc.Read(buf)
 		if n > 0 {
+			if !seen {
+				seen = true
+				readyTimer.Reset(relay.readyAfter)
+			}
 			relay.toClient(escapeIAC(buf[:n]))
 		}
 		if err != nil {
@@ -208,16 +252,58 @@ func (relay *consoleRelay) pump(proc consoleProcess) {
 	}
 }
 
-// toClient writes to the connected client, and drops a client that fails.
+// stalledWriteTimeout is how long a write waits on a client whose last write
+// timed out.
+const stalledWriteTimeout = time.Millisecond
+
+// toClient writes to the connected client outside the lock, so a client that
+// stops reading holds up neither a new client nor the shutdown. It drops output
+// the client does not take within writeTimeout, and a client that fails.
+//
+// A write cut off by its deadline can end between the two bytes of an escaped
+// 0xFF. The next write to that client starts with the second byte, so the
+// client reads a data byte, not a telnet command.
 func (relay *consoleRelay) toClient(data []byte) {
 	relay.mu.Lock()
-	defer relay.mu.Unlock()
-	if relay.client == nil {
+	client := relay.client
+	relay.mu.Unlock()
+	if client == nil {
 		return
 	}
-	if _, err := relay.client.Write(data); err != nil {
-		relay.client.Close()
-		relay.client = nil
+	open := relay.openIAC == client
+	if open {
+		data = append([]byte{telnetIAC}, data...)
+	}
+	timeout := relay.writeTimeout
+	if relay.stalled == client {
+		timeout = stalledWriteTimeout
+	}
+	_ = client.SetWriteDeadline(time.Now().Add(timeout))
+	n, err := client.Write(data)
+	for _, b := range data[:n] {
+		if b == telnetIAC {
+			open = !open
+		}
+	}
+	relay.openIAC = nil
+	if open {
+		relay.openIAC = client
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		if relay.stalled != client {
+			fmt.Fprintf(relay.progress, "Client %s is not reading, dropping console output.\n", client.RemoteAddr())
+		}
+		relay.stalled = client
+		return
+	}
+	relay.stalled = nil
+	if err != nil {
+		relay.mu.Lock()
+		if relay.client == client {
+			relay.client = nil
+		}
+		relay.mu.Unlock()
+		client.Close()
 	}
 }
 

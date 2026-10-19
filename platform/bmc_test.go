@@ -336,7 +336,8 @@ func TestBMCConsoleUsesTheSSHConsoleRedfishReports(t *testing.T) {
 	want := []string{
 		"sshpass", "-e", "ssh", "-tt", "-e", "none",
 		"-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
-		"-J", "jumphost", "-p", "2200", "-l", "root", driver.access.IP,
+		"-o", "ProxyCommand=ssh -o BatchMode=yes -o ConnectTimeout=10 -W '[%h]:%p' jumphost",
+		"-p", "2200", "-l", "root", driver.access.IP,
 	}
 	if got := runner.interactive[0]; !slices.Equal(got, want) {
 		t.Errorf("attach = %q, want %q", got, want)
