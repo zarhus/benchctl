@@ -151,6 +151,55 @@ func TestResolveDetachKeyRejectsAnUnknownKey(t *testing.T) {
 	}
 }
 
+func TestResolveBMCFlagsWinOverEnv(t *testing.T) {
+	t.Setenv("BENCHCTL_BMC_IP", "10.0.0.9")
+	t.Setenv("BENCHCTL_BMC_JUMP", "env-jump")
+	t.Setenv("BENCHCTL_BMC_CONSOLE_PORT", "2201")
+	got, err := resolveBMC(bmcFlags{ip: "10.0.0.5", consolePort: 2200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.IP != "10.0.0.5" || got.Jump != "env-jump" || got.ConsolePort != 2200 {
+		t.Errorf("resolveBMC = %+v, want the flags' address and port, the environment's jump host", got)
+	}
+}
+
+func TestResolveBMCReadsEveryEnvVar(t *testing.T) {
+	for env, val := range map[string]string{
+		"BENCHCTL_BMC_IP":            "10.0.0.5",
+		"BENCHCTL_BMC_JUMP":          "jump",
+		"BENCHCTL_BMC_USER":          "root",
+		"BENCHCTL_BMC_PASSWORD":      "pw",
+		"BENCHCTL_BMC_SYSTEM":        "System_0",
+		"BENCHCTL_BMC_CONSOLE":       "sol",
+		"BENCHCTL_BMC_CONSOLE_PORT":  "2200",
+		"BENCHCTL_BMC_CONSOLE_ENTRY": "console com2",
+		"BENCHCTL_BMC_CA":            "/etc/bmc.pem",
+		"BENCHCTL_BMC_INSECURE":      "true",
+	} {
+		t.Setenv(env, val)
+	}
+	got, err := resolveBMC(bmcFlags{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := platform.BMCAccess{
+		IP: "10.0.0.5", Jump: "jump", User: "root", Password: "pw", System: "System_0",
+		Console: "sol", ConsolePort: 2200, ConsoleEntry: "console com2",
+		CAFile: "/etc/bmc.pem", Insecure: true,
+	}
+	if got != want {
+		t.Errorf("resolveBMC = %+v, want %+v", got, want)
+	}
+}
+
+func TestResolveBMCRejectsABadPort(t *testing.T) {
+	t.Setenv("BENCHCTL_BMC_CONSOLE_PORT", "ssh")
+	if _, err := resolveBMC(bmcFlags{}); err == nil {
+		t.Error("resolveBMC accepted a console port that is not a number")
+	}
+}
+
 func TestBuildUnknownPlatformErrors(t *testing.T) {
 	_, err := build(options{host: "bench.local", platform: "no-such"})
 	if err == nil || !strings.Contains(err.Error(), "no-such") {

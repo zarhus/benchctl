@@ -142,8 +142,25 @@ type Platform interface {
 // Config carries resolved, driver-agnostic options into a driver constructor.
 // A driver uses only the fields that apply to it.
 type Config struct {
-	Board     string // selected board; drivers that support several boards use it
-	TasmotaIP string // override for the AC-control Tasmota plug's address; empty uses the board default
+	Board     string    // selected board; drivers that support several boards use it
+	TasmotaIP string    // override for the AC-control Tasmota plug's address; empty uses the board default
+	BMC       BMCAccess // how the bmc driver reaches its BMC
+}
+
+// BMCAccess is how the bmc driver reaches a BMC from the workstation: Redfish
+// for power, and the BMC's SSH console or IPMI SOL for the host console. Empty
+// fields take the value the BMC reports over Redfish, or the driver's default.
+type BMCAccess struct {
+	IP           string // BMC address
+	Jump         string // ssh destination the BMC is reached through; empty connects directly
+	User         string // BMC account for Redfish, the SSH console and SOL
+	Password     string // password for User
+	System       string // Redfish ComputerSystem ID; empty uses the only one
+	Console      string // "ssh" or "sol"; empty picks from SerialConsole
+	ConsolePort  int    // SSH console port; zero takes it from SerialConsole
+	ConsoleEntry string // command that switches an SSH login to the host console
+	CAFile       string // PEM bundle that verifies the BMC's certificate
+	Insecure     bool   // skip verifying the BMC's certificate
 }
 
 // Spec describes a platform driver: its name, default SSH credentials, and a

@@ -98,6 +98,11 @@ func shellJoin(argv []string) string {
 	return strings.Join(quoted, " ")
 }
 
+// ShellJoin is shellJoin for a driver that builds its own ssh command line.
+func ShellJoin(argv []string) string {
+	return shellJoin(argv)
+}
+
 // shellSafe matches arguments that need no quoting for a POSIX shell.
 var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./-]+$`)
 

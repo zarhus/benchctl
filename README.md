@@ -181,8 +181,9 @@ and stranding the payload.
 the RTE separately from COM1, typically host firmware output running alongside
 the BMC's own console on COM1. There is nothing to type into it, so the attach
 is a plain `stty`-configured `cat` of the device rather than an interactive
-program. Boards without a wired UART1 report the command as not implemented.
-`--bmc-ip`, `--bmc-user`, and `--bmc-password` apply only with `--source sol`.
+program. Boards without a wired UART1 report the command as not implemented. On
+every platform but `bmc`, `--bmc-ip`, `--bmc-user`, and `--bmc-password` are
+read only with `--source sol`.
 
 ## Platforms
 
@@ -190,6 +191,7 @@ program. Boards without a wired UART1 report the command as not implemented.
 | ----------- | ----------- | --------------------------- |
 | `benchrack` | implemented | `root` / `meta-rte`         |
 | `fvp`       | implemented | none (always local)         |
+| `bmc`       | implemented | none (always local)         |
 
 BenchRack flashes the host and BMC flashes through the SPI mux, controls host
 power through the RTE, switches the mains feed through a Tasmota plug, and
@@ -300,6 +302,67 @@ per group when present; a missing one is just omitted, with a note, rather than
 failing the launch. `pcie_group_0` needs no file of its own and is always
 configured.
 
+### `bmc`
+
+`bmc` (`platform/bmc.go`) drives a host through its BMC alone, from your PC:
+host power over Redfish and the host console over the BMC's SSH console, with
+IPMI SOL as the fallback. It is for a machine that is not on a bench, such as
+one reached through an ssh jump host on someone else's network. It never touches
+AC power or flash, which report "not implemented", and `--host` is `localhost`.
+
+| Setting           | Flag                  | Environment                  | Default                         |
+| ----------------- | --------------------- | ---------------------------- | ------------------------------- |
+| BMC address       | `--bmc-ip`            | `BENCHCTL_BMC_IP`            | none, required                  |
+| BMC user          | `--bmc-user`          | `BENCHCTL_BMC_USER`          | none, required                  |
+| BMC password      | `--bmc-password`      | `BENCHCTL_BMC_PASSWORD`      | none, required                  |
+| Jump host         | `--bmc-jump`          | `BENCHCTL_BMC_JUMP`          | empty, connect directly         |
+| Redfish system ID | `--bmc-system`        | `BENCHCTL_BMC_SYSTEM`        | the only member of `Systems`    |
+| Console method    | `--bmc-console`       | `BENCHCTL_BMC_CONSOLE`       | from `SerialConsole`, else ssh  |
+| SSH console port  | `--bmc-console-port`  | `BENCHCTL_BMC_CONSOLE_PORT`  | from `SerialConsole`, else 2200 |
+| Console entry     | `--bmc-console-entry` | `BENCHCTL_BMC_CONSOLE_ENTRY` | from `ConsoleEntryCommand`      |
+| TLS CA bundle     | `--bmc-ca`            | `BENCHCTL_BMC_CA`            | system roots                    |
+| Skip TLS checks   | `--bmc-insecure`      | `BENCHCTL_BMC_INSECURE`      | off                             |
+
+```sh
+export BENCHCTL_PLATFORM=bmc BENCHCTL_HOST=localhost
+export BENCHCTL_BMC_IP=10.0.0.5 BENCHCTL_BMC_JUMP=client-jump
+export BENCHCTL_BMC_USER=root BENCHCTL_BMC_PASSWORD=...
+bin/benchctl power status
+bin/benchctl power on
+bin/benchctl console
+```
+
+The jump host is an ssh destination, best a `Host` entry in `~/.ssh/config`,
+which supplies its user, keys and any further hops. It has to accept your key,
+since the password prompt `sshpass` answers belongs to the BMC. Redfish
+connections cross it with `ssh -W <bmc>:443`, one per request, and the SSH
+console with `ssh -J`. The BMC's host key is recorded on first use
+(`StrictHostKeyChecking=accept-new`).
+
+Power maps onto `ComputerSystem.Reset`: `power on` sends `On`, `power off` sends
+`ForceOff`, `power reset` sends `ForceRestart`, or `PowerCycle` where the BMC
+does not allow `ForceRestart`, and `power reset --hard` sends `ForceRestart`
+only. The driver reads `ResetType@Redfish.AllowableValues` to choose, and each
+command polls `PowerState` until the host gets there.
+
+`console` reads the system's `SerialConsole`. An enabled `SSH` entry gives the
+port, and `SharedWithManagerCLI` with `ConsoleEntryCommand` gives the command
+that reaches the host console from the BMC's own command line, as on Dell iDRAC
+(`console com2`). Without `SSH`, an enabled `IPMI` entry selects SOL. A BMC that
+reports neither, or a Redfish service that does not answer, gets SSH on port
+2200, OpenBMC's `obmc-console-ssh`, when an SSH server answers there, reached
+the same way as Redfish, and SOL when none does. The settings override each of
+these, and with the method and port both set the console needs no Redfish
+request.
+
+SOL runs `ipmitool` on the jump host, since IPMI is UDP and the jump host
+forwards TCP only. The password reaches it in `IPMI_PASSWORD` through the remote
+command line, and the SSH console's through `SSHPASS`, which keeps it out of the
+local process list. `console --source sol` forces SOL with the same settings.
+Like the BenchRack SOL console, it runs `sol deactivate` before and after the
+attach, which drops anyone else on the payload, while the SSH console lets
+several people attach at once.
+
 Adding another platform is one package that implements the `Platform` interface
 and registers itself with `platform.Register()` from its `init()`. Drivers can
 live in this repository (like `platform/benchrack.go` and `platform/fvp.go`) or
@@ -308,6 +371,8 @@ in a separate module that imports this one and builds its own `main`.
 ## Dependencies
 
 - On the PC: `ssh`, `scp`, `sshpass`.
+- For `bmc`: `ssh` and `sshpass` on the PC, `ipmitool` on the jump host (or the
+  PC without one) for SOL.
 - On a BenchRack RTE: `flashrom`, `telnet`, `curl` (for `power ac`), `ipmitool`
   (for `console --source sol`), `stty` and `cat` (for `console --source uart1`),
   and the RteCtrl REST API (port 8000).

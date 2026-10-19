@@ -20,20 +20,36 @@ import (
 
 // Client builds commands for one BMC.
 type Client struct {
-	ip       string
-	user     string
-	password string
+	ip          string
+	user        string
+	password    string
+	passwordEnv bool
 }
+
+// PasswordEnv is the environment variable ipmitool reads the password from
+// with -E.
+const PasswordEnv = "IPMI_PASSWORD"
 
 // New returns a client for the BMC at ip.
 func New(ip, user, password string) *Client {
 	return &Client{ip: ip, user: user, password: password}
 }
 
+// NewEnvPassword returns a client whose commands read the password from
+// PasswordEnv, which the caller sets, so it stays off ipmitool's command line.
+func NewEnvPassword(ip, user string) *Client {
+	return &Client{ip: ip, user: user, passwordEnv: true}
+}
+
 // argv prefixes an ipmitool subcommand with the connection arguments. lanplus is
 // IPMI 2.0 RMCP+, which OpenBMC requires.
 func (c *Client) argv(sub ...string) []string {
-	argv := []string{"ipmitool", "-I", "lanplus", "-H", c.ip, "-U", c.user, "-P", c.password}
+	argv := []string{"ipmitool", "-I", "lanplus", "-H", c.ip, "-U", c.user}
+	if c.passwordEnv {
+		argv = append(argv, "-E")
+	} else {
+		argv = append(argv, "-P", c.password)
+	}
 	return append(argv, sub...)
 }
 

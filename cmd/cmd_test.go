@@ -290,7 +290,17 @@ func TestConsoleDefaultsToCOM1(t *testing.T) {
 	}
 }
 
+// clearBMCEnv clears the BMC settings' environment variables for the test, so
+// the caller's own shell does not change what the flags resolve to.
+func clearBMCEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{"BENCHCTL_BMC_IP", "BENCHCTL_BMC_USER", "BENCHCTL_BMC_PASSWORD"} {
+		t.Setenv(name, "")
+	}
+}
+
 func TestConsoleSourceSOLPassesBMCWithCredentialDefaults(t *testing.T) {
+	clearBMCEnv(t)
 	fake := &fakePlatform{}
 	withFakePlatform(t, fake)
 	if _, err := run(t, "console", "--source", "sol", "--bmc-ip", "192.168.50.11"); err != nil {
@@ -319,7 +329,7 @@ func TestConsoleSourceSOLCredentialOverrides(t *testing.T) {
 }
 
 func TestConsoleSourceSOLNeedsABMCIP(t *testing.T) {
-	t.Setenv("BENCHCTL_BMC_IP", "")
+	clearBMCEnv(t)
 	withFakePlatform(t, &fakePlatform{})
 	if _, err := run(t, "console", "--source", "sol"); err == nil {
 		t.Error("console --source sol without --bmc-ip should be rejected")
@@ -327,6 +337,7 @@ func TestConsoleSourceSOLNeedsABMCIP(t *testing.T) {
 }
 
 func TestConsoleSourceSOLUsesBMCIPEnvVar(t *testing.T) {
+	clearBMCEnv(t)
 	t.Setenv("BENCHCTL_BMC_IP", "192.168.50.11")
 	fake := &fakePlatform{}
 	withFakePlatform(t, fake)
@@ -348,21 +359,6 @@ func TestConsoleSourceSOLBMCIPFlagWinsOverEnvVar(t *testing.T) {
 	}
 	if fake.solBMC == nil || fake.solBMC.IP != "192.168.50.11" {
 		t.Errorf("console --source sol BMC = %+v, want the flag's address", fake.solBMC)
-	}
-}
-
-func TestConsoleBMCFlagsRequireSourceSOL(t *testing.T) {
-	// Passing a BMC flag with the default (or uart1) source asks for a console
-	// with arguments that do not apply to it, which is a mistake worth reporting.
-	for _, flag := range []string{"--bmc-ip", "--bmc-user", "--bmc-password"} {
-		fake := &fakePlatform{}
-		withFakePlatform(t, fake)
-		if _, err := run(t, "console", flag, "value"); err == nil {
-			t.Errorf("console %s without --source sol should be rejected", flag)
-		}
-		if fake.console {
-			t.Errorf("console %s without --source sol attached the serial console anyway", flag)
-		}
 	}
 }
 

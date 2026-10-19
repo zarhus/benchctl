@@ -23,7 +23,17 @@ var (
 	flagTasmotaIP string
 	flagVerbose   bool
 	flagDetachKey string
+	flagBMC       bmcFlags
 )
+
+// bmcFlags are the BMC settings: the bmc platform reads all of them, and
+// console --source sol reads the address and credentials on any platform.
+type bmcFlags struct {
+	ip, jump, user, password, system string
+	console, consoleEntry, caFile    string
+	consolePort                      int
+	insecure                         bool
+}
 
 // buildPlatform is the constructor commands use to obtain a Platform. It is a
 // variable so tests can substitute a fake.
@@ -50,6 +60,16 @@ func newRootCmd() *cobra.Command {
 	flags.StringVar(&flagPassword, "password", "", "SSH root password override (or BENCHCTL_PASSWORD)")
 	flags.StringVar(&flagBoard, "board", "", "board profile for multi-board platforms (or BENCHCTL_BOARD)")
 	flags.BoolVarP(&flagVerbose, "verbose", "v", false, "trace bench commands")
+	flags.StringVar(&flagBMC.ip, "bmc-ip", "", "BMC `address` (or BENCHCTL_BMC_IP)")
+	flags.StringVar(&flagBMC.user, "bmc-user", "", "BMC user (or BENCHCTL_BMC_USER; admin for --source sol)")
+	flags.StringVar(&flagBMC.password, "bmc-password", "", "BMC password (or BENCHCTL_BMC_PASSWORD; Administrator for --source sol)")
+	flags.StringVar(&flagBMC.jump, "bmc-jump", "", "ssh `destination` the BMC is reached through (or BENCHCTL_BMC_JUMP)")
+	flags.StringVar(&flagBMC.system, "bmc-system", "", "Redfish system `ID` (or BENCHCTL_BMC_SYSTEM; default the only one)")
+	flags.StringVar(&flagBMC.console, "bmc-console", "", "BMC console `method`, ssh or sol (or BENCHCTL_BMC_CONSOLE; default from Redfish)")
+	flags.IntVar(&flagBMC.consolePort, "bmc-console-port", 0, "BMC SSH console `port` (or BENCHCTL_BMC_CONSOLE_PORT; default from Redfish, else 2200)")
+	flags.StringVar(&flagBMC.consoleEntry, "bmc-console-entry", "", "`command` that reaches the host console after an SSH login (or BENCHCTL_BMC_CONSOLE_ENTRY)")
+	flags.StringVar(&flagBMC.caFile, "bmc-ca", "", "PEM `file` that verifies the BMC's certificate (or BENCHCTL_BMC_CA)")
+	flags.BoolVar(&flagBMC.insecure, "bmc-insecure", false, "skip verifying the BMC's certificate (or BENCHCTL_BMC_INSECURE=1)")
 	_ = flags.MarkHidden("platform")
 
 	root.AddCommand(powerCmd(), consoleCmd(), flashCmd(), diskCmd())
@@ -65,6 +85,7 @@ func opts() options {
 		tasmotaIP: flagTasmotaIP,
 		verbose:   flagVerbose,
 		detachKey: flagDetachKey,
+		bmc:       flagBMC,
 	}
 }
 

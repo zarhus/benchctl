@@ -7,6 +7,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/zarhus/benchctl/exec"
 	"github.com/zarhus/benchctl/platform"
@@ -21,6 +22,7 @@ type options struct {
 	tasmotaIP string
 	verbose   bool
 	detachKey string
+	bmc       bmcFlags
 }
 
 // resolveHost returns the bench host from the flag, then BENCHCTL_HOST, and
@@ -69,10 +71,59 @@ func resolveTasmotaIP(flagVal string) string {
 // resolveBMCIP returns the BMC address for --source sol from the flag, then
 // BENCHCTL_BMC_IP, then empty so the caller reports it as missing.
 func resolveBMCIP(flagVal string) string {
+	return resolveSetting(flagVal, "BENCHCTL_BMC_IP")
+}
+
+// resolveSetting returns the flag's value, then the environment variable's.
+func resolveSetting(flagVal, env string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	return os.Getenv("BENCHCTL_BMC_IP")
+	return os.Getenv(env)
+}
+
+// resolveSettingOr is resolveSetting with a default for when both are unset.
+func resolveSettingOr(flagVal, env, def string) string {
+	if val := resolveSetting(flagVal, env); val != "" {
+		return val
+	}
+	return def
+}
+
+// resolveBMC returns the BMC settings from the flags, then their environment
+// variables.
+func resolveBMC(flags bmcFlags) (platform.BMCAccess, error) {
+	access := platform.BMCAccess{
+		IP:           resolveSetting(flags.ip, "BENCHCTL_BMC_IP"),
+		Jump:         resolveSetting(flags.jump, "BENCHCTL_BMC_JUMP"),
+		User:         resolveSetting(flags.user, "BENCHCTL_BMC_USER"),
+		Password:     resolveSetting(flags.password, "BENCHCTL_BMC_PASSWORD"),
+		System:       resolveSetting(flags.system, "BENCHCTL_BMC_SYSTEM"),
+		Console:      resolveSetting(flags.console, "BENCHCTL_BMC_CONSOLE"),
+		ConsolePort:  flags.consolePort,
+		ConsoleEntry: resolveSetting(flags.consoleEntry, "BENCHCTL_BMC_CONSOLE_ENTRY"),
+		CAFile:       resolveSetting(flags.caFile, "BENCHCTL_BMC_CA"),
+		Insecure:     flags.insecure,
+	}
+	if access.ConsolePort == 0 {
+		if val := os.Getenv("BENCHCTL_BMC_CONSOLE_PORT"); val != "" {
+			port, err := strconv.Atoi(val)
+			if err != nil || port <= 0 || port > 65535 {
+				return access, fmt.Errorf("BENCHCTL_BMC_CONSOLE_PORT=%q is not a port number", val)
+			}
+			access.ConsolePort = port
+		}
+	}
+	if !access.Insecure {
+		if val := os.Getenv("BENCHCTL_BMC_INSECURE"); val != "" {
+			insecure, err := strconv.ParseBool(val)
+			if err != nil {
+				return access, fmt.Errorf("BENCHCTL_BMC_INSECURE=%q is not a boolean", val)
+			}
+			access.Insecure = insecure
+		}
+	}
+	return access, nil
 }
 
 // resolveDetachKey returns the console detach key from the flag, then
@@ -128,9 +179,14 @@ func build(opts options) (platform.Platform, error) {
 		return nil, err
 	}
 	runner := &exec.CmdRunner{Target: target, Verbose: opts.verbose, DetachKey: detachKey}
+	bmc, err := resolveBMC(opts.bmc)
+	if err != nil {
+		return nil, err
+	}
 	config := platform.Config{
 		Board:     resolveBoard(opts.board),
 		TasmotaIP: resolveTasmotaIP(opts.tasmotaIP),
+		BMC:       bmc,
 	}
 	return spec.New(runner, config), nil
 }
