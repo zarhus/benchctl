@@ -205,13 +205,14 @@ func TestRunToleratesNoAcknowledgment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	c.ackWait = 50 * time.Millisecond
 
 	start := time.Now()
 	if err := c.Run(1); err != nil {
 		t.Fatalf("Run with no acknowledgment: want nil (tolerated), got %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("Run with no acknowledgment took %s, want it bounded by ackTimeout (%s), not the connection's own 10s timeout", elapsed, ackTimeout)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Run with no acknowledgment took %s, want it bounded by ackWait (%s), not the connection's own 10s timeout", elapsed, c.ackWait)
 	}
 }
 

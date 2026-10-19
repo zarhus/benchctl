@@ -52,6 +52,7 @@ type Client struct {
 	nextID  int64
 	instID  int64         // this connection's own registered instance id - see generateID
 	timeout time.Duration // re-applied as a fresh deadline before every call
+	ackWait time.Duration // how long callTolerant waits for a response, ackTimeout by default
 }
 
 // generateID builds a request id the way Arm's own reference client does
@@ -96,7 +97,7 @@ func Dial(addr string, timeout time.Duration) (*Client, error) {
 		conn.Close()
 		return nil, err
 	}
-	c := &Client{conn: conn, r: bufio.NewReader(conn), timeout: timeout}
+	c := &Client{conn: conn, r: bufio.NewReader(conn), timeout: timeout, ackWait: ackTimeout}
 	if err := c.handshake(); err != nil {
 		conn.Close()
 		return nil, err
@@ -354,7 +355,7 @@ func (c *Client) callTolerant(method string, params any) error {
 	if err := c.writeMessage(payload); err != nil {
 		return fmt.Errorf("iris: send %s: %w", method, err)
 	}
-	if err := c.conn.SetDeadline(time.Now().Add(ackTimeout)); err != nil {
+	if err := c.conn.SetDeadline(time.Now().Add(c.ackWait)); err != nil {
 		return err
 	}
 	format, data, err := c.readMessage()

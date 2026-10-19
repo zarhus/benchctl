@@ -109,6 +109,10 @@ type fvpPlatform struct {
 	// with an empty argv.
 	configErr error
 	progress  io.Writer
+
+	startGrace    time.Duration // see the startGrace constant
+	shutdownGrace time.Duration // see the irisShutdownGrace constant
+	norSize       int           // see the norFlashSize constant
 }
 
 func newFVP(runner exec.Runner, cfg Config) Platform {
@@ -116,7 +120,7 @@ func newFVP(runner exec.Runner, cfg Config) Platform {
 	if name == "" {
 		name = defaultProfile
 	}
-	fv := &fvpPlatform{runner: runner, progress: os.Stderr}
+	fv := &fvpPlatform{runner: runner, progress: os.Stderr, startGrace: startGrace, shutdownGrace: irisShutdownGrace, norSize: norFlashSize}
 
 	prof, ok := profiles[name]
 	if !ok {
@@ -686,11 +690,8 @@ func (fv *fvpPlatform) start() error {
 	// beat. Catching that here turns a silent no-op boot into an error naming
 	// what the model printed, rather than a gate failing downstream with
 	// nothing in the process log to explain why.
-	const (
-		graceWindow = 300 * time.Millisecond
-		probeEvery  = 20 * time.Millisecond
-	)
-	deadline := time.Now().Add(graceWindow)
+	const probeEvery = 20 * time.Millisecond
+	deadline := time.Now().Add(fv.startGrace)
 	for isAlive(pid) && time.Now().Before(deadline) {
 		time.Sleep(probeEvery)
 	}
@@ -900,21 +901,21 @@ func (c fipComponents) args() []string {
 
 // norFlashImages returns the paths of the two dummy NOR flash images the
 // platform expects at ros.board.flashloader{1,2}, creating them (gzipped,
-// all-zero, norFlashSize) if they are not already there. They live in
+// all-zero, fv.norSize) if they are not already there. They live in
 // workDir rather than beside the flashed image, since they are state this
 // driver owns, not something `flash write` records.
 func (fv *fvpPlatform) norFlashImages() (nor1, nor2 string, err error) {
 	nor1 = filepath.Join(fv.workDir, "nor1_flash.img")
 	nor2 = filepath.Join(fv.workDir, "nor2_flash.img")
 	for _, path := range []string{nor1, nor2} {
-		if err := createDummyNORImage(path); err != nil {
+		if err := createDummyNORImage(path, fv.norSize); err != nil {
 			return "", "", fmt.Errorf("create %s: %w", path, err)
 		}
 	}
 	return nor1, nor2, nil
 }
 
-func createDummyNORImage(path string) error {
+func createDummyNORImage(path string, size int) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
@@ -925,13 +926,17 @@ func createDummyNORImage(path string) error {
 	defer f.Close()
 	gz := gzip.NewWriter(f)
 	zero := make([]byte, 256*1024)
-	for written := 0; written < norFlashSize; written += len(zero) {
+	for written := 0; written < size; written += len(zero) {
 		if _, err := gz.Write(zero); err != nil {
 			return err
 		}
 	}
 	return gz.Close()
 }
+
+// startGrace is how long start watches a freshly launched model for an
+// immediate exit.
+const startGrace = 300 * time.Millisecond
 
 // irisShutdownGrace bounds how long stop waits for a requested Iris
 // graceful shutdown to actually take effect before falling back to a
@@ -965,7 +970,7 @@ func (fv *fvpPlatform) stop(sig syscall.Signal) error {
 			client.Close()
 			if requestErr == nil {
 				fmt.Fprintln(fv.progress, "Stopping the model (Iris graceful shutdown requested)...")
-				deadline := time.Now().Add(irisShutdownGrace)
+				deadline := time.Now().Add(fv.shutdownGrace)
 				for isAlive(pid) && time.Now().Before(deadline) {
 					time.Sleep(fv.pollEvery)
 				}

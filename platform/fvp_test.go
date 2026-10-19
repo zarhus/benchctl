@@ -40,6 +40,12 @@ func testPlatform(t *testing.T, modelScript string) *fvpPlatform {
 	// that powers on does not have to set this up itself; the two tests that
 	// specifically cover the missing-file case remove it again.
 	populateOutputComponents(t, fv)
+	// The fake models start, fail and stop in milliseconds, so the waits sized
+	// for a real model only slow the tests down.
+	fv.startGrace = 50 * time.Millisecond
+	fv.shutdownGrace = 50 * time.Millisecond
+	fv.pollEvery = 10 * time.Millisecond
+	fv.norSize = 256 * 1024
 	return fv
 }
 
