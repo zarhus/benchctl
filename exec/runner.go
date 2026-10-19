@@ -5,6 +5,7 @@
 package exec
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/creack/pty"
+	"golang.org/x/term"
 )
 
 // ExitCode reports the exit status of the command behind err, and whether err
@@ -69,6 +75,9 @@ type Runner interface {
 	// second control surface on the same host (e.g. a REST API). It is
 	// "localhost" (or "") when commands run locally.
 	Host() string
+	// DetachHint names the key that ends an interactive run, as typed, such as
+	// "Ctrl+]". It is empty when the program's own detach sequence ends it.
+	DetachHint() string
 }
 
 // CmdRunner is the production Runner. It runs commands locally when the target
@@ -76,6 +85,12 @@ type Runner interface {
 type CmdRunner struct {
 	Target  Target
 	Verbose bool
+	// DetachKey, when non-zero, is the key that ends every interactive run. The
+	// runner reads the terminal itself, in raw mode, passes every other key to
+	// the program, and stops the program on this key. The SSH hop then runs with
+	// its escape character disabled, so "~" reaches the program on the bench.
+	// Zero leaves the terminal to the program and its own detach sequence.
+	DetachKey byte
 }
 
 // commandArgv wraps a bench command for execution: unchanged when local, or an
@@ -97,6 +112,13 @@ func (runner *CmdRunner) trace(argv []string) {
 
 func (runner *CmdRunner) Host() string {
 	return runner.Target.Host
+}
+
+func (runner *CmdRunner) DetachHint() string {
+	if runner.DetachKey == 0 {
+		return ""
+	}
+	return DetachKeyName(runner.DetachKey)
 }
 
 // unreachable classifies a failed ssh invocation: it returns an UnreachableError
@@ -151,17 +173,10 @@ func (runner *CmdRunner) RunInteractiveNoEscape(argv ...string) error {
 // either fd, land in the exact order it issued them, the same as a real
 // terminal would serialize them.
 func (runner *CmdRunner) RunInteractiveOut(out io.Writer, argv ...string) error {
-	full := runner.commandArgv(argv, remoteTTY)
-	runner.trace(full)
-	cmd := exec.Command(full[0], full[1:]...)
-	cmd.Stdin = os.Stdin
-
 	r, w, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("%s: %w", shellJoin(argv), err)
 	}
-	cmd.Stdout = w
-	cmd.Stderr = w
 
 	copyDone := make(chan struct{})
 	go func() {
@@ -169,34 +184,134 @@ func (runner *CmdRunner) RunInteractiveOut(out io.Writer, argv ...string) error 
 		close(copyDone)
 	}()
 
-	runErr := cmd.Run()
+	runErr := runner.runInteractive(argv, remoteTTY, w, w)
 	w.Close()
 	<-copyDone
 	r.Close()
-
-	if runErr == nil {
-		return nil
-	}
-	// ssh wrote its own diagnosis into out, so there is nothing to carry in
-	// Detail.
-	if unreachable := runner.unreachable(runErr, ""); unreachable != nil {
-		return unreachable
-	}
 	return runErr
 }
 
+// runInteractive runs argv attached to the local terminal, with its output to
+// stdout and stderr. With a detach key set, runDetachable reads the terminal
+// instead.
 func (runner *CmdRunner) runInteractive(argv []string, mode ttyMode, stdout, stderr io.Writer) error {
+	if runner.DetachKey != 0 {
+		return runner.runDetachable(argv, remoteTTYNoEscape, stdout, os.Stdin, runner.DetachKey)
+	}
 	full := runner.commandArgv(argv, mode)
 	runner.trace(full)
 	cmd := exec.Command(full[0], full[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	err := cmd.Run()
+	return runner.interactiveErr(cmd.Run())
+}
+
+// runDetachable runs argv like runInteractive, but reads the keys from in
+// itself and stops the program on key. The program's output, standard error
+// included, goes to out.
+//
+// The program runs on a pseudo-terminal of its own, which benchctl reads and
+// writes, so it finds a terminal where it expects one: ipmitool and telnet put
+// it into raw mode, and Ctrl+C reaches a plain cat as SIGINT. The local terminal
+// goes into raw mode for the session, as ssh would put it if it read the
+// terminal itself, so each key arrives as typed rather than a line at a time or
+// as a signal to benchctl.
+//
+// The program leads a session of its own, so the stop reaches everything it
+// started: a local shell's cat, which would otherwise hold the output open, or
+// ssh behind sshpass, which passes SIGTERM on. ssh then drops the connection,
+// and the bench's pty hangs up the program on the far side.
+func (runner *CmdRunner) runDetachable(argv []string, mode ttyMode, out io.Writer, in *os.File, key byte) error {
+	full := runner.commandArgv(argv, mode)
+	runner.trace(full)
+	cmd := exec.Command(full[0], full[1:]...)
+	inFd := int(in.Fd())
+	local := term.IsTerminal(inFd)
+	if local {
+		state, err := term.MakeRaw(inFd)
+		if err != nil {
+			return fmt.Errorf("terminal raw mode: %w", err)
+		}
+		defer func() { _ = term.Restore(inFd, state) }()
+	}
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return fmt.Errorf("%s: %w", shellJoin(argv), err)
+	}
+	defer ptmx.Close()
+	if local {
+		_ = pty.InheritSize(in, ptmx)
+		defer followResize(in, ptmx)()
+	}
+
+	copied := make(chan struct{})
+	go func() {
+		// The read fails once the program and everything it started have closed
+		// the terminal, which is the end of its output.
+		_, _ = io.Copy(out, ptmx)
+		close(copied)
+	}()
+	var detached atomic.Bool
+	go func() {
+		// The read in flight when the session ends has nowhere to go, and ends
+		// with the process.
+		if forwardUntil(ptmx, in, key) {
+			detached.Store(true)
+			stopProcessGroup(cmd.Process)
+		}
+	}()
+	err = cmd.Wait()
+	// A background process the program left behind can hold the terminal open,
+	// so the output gets a moment to drain and then ends with the program.
+	select {
+	case <-copied:
+	case <-time.After(outputDrain):
+		ptmx.Close()
+		<-copied
+	}
+	// The stop makes the program exit with a signal, and ssh with 255, which
+	// would otherwise read as an unreachable bench.
+	if detached.Load() {
+		return nil
+	}
+	return runner.interactiveErr(err)
+}
+
+// outputDrain is how long runDetachable reads output after the program exits.
+const outputDrain = 200 * time.Millisecond
+
+// forwardUntil copies src to dst up to key, which it drops. It reports whether
+// it stopped on key, rather than on the end of src or a failed write.
+func forwardUntil(dst io.Writer, src io.Reader, key byte) bool {
+	buf := make([]byte, 256)
+	for {
+		n, err := src.Read(buf)
+		chunk := buf[:n]
+		i := bytes.IndexByte(chunk, key)
+		if i >= 0 {
+			chunk = chunk[:i]
+		}
+		if len(chunk) > 0 {
+			if _, werr := dst.Write(chunk); werr != nil {
+				return false
+			}
+		}
+		if i >= 0 {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
+// interactiveErr classifies the result of an interactive session.
+func (runner *CmdRunner) interactiveErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	// ssh wrote its own diagnosis straight to the terminal, so there is nothing to
+	// ssh wrote its own diagnosis to the session's output, so there is nothing to
 	// carry in Detail.
 	if unreachable := runner.unreachable(err, ""); unreachable != nil {
 		return unreachable

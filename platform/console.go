@@ -18,15 +18,17 @@ import (
 // around the session, and the error wrapping, so every console behaves the same
 // way whatever tool carries it.
 //
-// The detach sequence belongs to the program in Attach rather than to benchctl,
-// which only spawns it, so it differs from one console to the next. Detach
-// carries it into the line printed immediately before the terminal is handed
-// over, where the operator needs it.
+// The runner's detach key ends every session the same way. With no detach key
+// set, the session ends on the program's own detach sequence, which differs
+// from one console to the next. Detach carries that sequence. The line printed
+// immediately before the terminal is handed over names whichever applies, where
+// the operator needs it.
 type ConsoleSession struct {
 	// What names the console in messages, as in "host console via telnet on
 	// port 13541".
 	What string
-	// Detach is the sequence that ends the session, written as it is typed.
+	// Detach is the program's own sequence that ends the session, written as it
+	// is typed. The runner's detach key takes its place when one is set.
 	Detach string
 	// Attach is the command that holds the terminal for the session.
 	Attach []string
@@ -83,7 +85,11 @@ func (session ConsoleSession) Run(runner exec.Runner, progress io.Writer) error 
 	if session.Out != nil {
 		out = session.Out
 	}
-	fmt.Fprintf(out, "Attaching to %s. Detach with %s.\n", session.What, session.Detach)
+	detach := session.Detach
+	if hint := runner.DetachHint(); hint != "" {
+		detach = hint
+	}
+	fmt.Fprintf(out, "Attaching to %s. Detach with %s.\n", session.What, detach)
 	var err error
 	if session.Out != nil {
 		err = runner.RunInteractiveOut(session.Out, session.Attach...)

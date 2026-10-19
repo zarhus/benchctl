@@ -124,6 +124,33 @@ func TestResolveBMCIPEmptyWhenUnset(t *testing.T) {
 	}
 }
 
+func TestResolveDetachKeyFlagWins(t *testing.T) {
+	t.Setenv("BENCHCTL_DETACH_KEY", "ctrl+b")
+	if got, err := resolveDetachKey("ctrl+a"); err != nil || got != 0x01 {
+		t.Errorf("resolveDetachKey = %#x, %v, want 0x01", got, err)
+	}
+}
+
+func TestResolveDetachKeyEnvFallback(t *testing.T) {
+	t.Setenv("BENCHCTL_DETACH_KEY", "none")
+	if got, err := resolveDetachKey(""); err != nil || got != 0 {
+		t.Errorf("resolveDetachKey = %#x, %v, want 0 for none", got, err)
+	}
+}
+
+func TestResolveDetachKeyDefaultsToCtrlBracket(t *testing.T) {
+	t.Setenv("BENCHCTL_DETACH_KEY", "")
+	if got, err := resolveDetachKey(""); err != nil || got != 0x1D {
+		t.Errorf("resolveDetachKey = %#x, %v, want 0x1d", got, err)
+	}
+}
+
+func TestResolveDetachKeyRejectsAnUnknownKey(t *testing.T) {
+	if _, err := resolveDetachKey("alt+x"); err == nil {
+		t.Error("resolveDetachKey(alt+x) succeeded, want an error")
+	}
+}
+
 func TestBuildUnknownPlatformErrors(t *testing.T) {
 	_, err := build(options{host: "bench.local", platform: "no-such"})
 	if err == nil || !strings.Contains(err.Error(), "no-such") {

@@ -22,6 +22,7 @@ var (
 	flagBoard     string
 	flagTasmotaIP string
 	flagVerbose   bool
+	flagDetachKey string
 )
 
 // buildPlatform is the constructor commands use to obtain a Platform. It is a
@@ -63,6 +64,7 @@ func opts() options {
 		board:     flagBoard,
 		tasmotaIP: flagTasmotaIP,
 		verbose:   flagVerbose,
+		detachKey: flagDetachKey,
 	}
 }
 

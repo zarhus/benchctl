@@ -136,6 +136,15 @@ error rather than a long wait.
 `--source` selects where `benchctl console` attaches: `com1` (the default),
 `sol`, or `uart1`.
 
+Every source detaches on `Ctrl+]`, which benchctl reads itself. The terminal
+goes into raw mode for the session, every other key reaches the console program,
+and the key stops that program and everything it started. The SSH hop to the
+bench runs with its escape character disabled, so `~` reaches the console too.
+`--detach-key` (or `BENCHCTL_DETACH_KEY`) picks another key, written as
+`ctrl+<key>` with a letter or one of `[ \ ] ^ _`. `--detach-key none` hands the
+terminal to the console program, which then ends on its own sequence: `Ctrl+]`
+then `quit` for telnet, `~.` at the start of a line for SOL, `Ctrl+C` for UART1.
+
 `--source com1` attaches to the motherboard's COM1 port, which the RTE exports
 over telnet with ser2net. That port carries host output only while the BMC
 leaves it to the host. An OpenBMC configured to print its own logs there takes
@@ -152,29 +161,28 @@ bin/benchctl --host rte.local console --source sol --bmc-ip 192.168.50.11
 `--host`. The credentials default to `admin` and `Administrator`, overridden
 with `--bmc-user` and `--bmc-password`.
 
-Detach with `~.` at the start of a line. Every attach runs `sol deactivate`
-first, and again on the way out, because a session that ended any other way,
-such as a closed terminal or a dropped connection, leaves the payload open on
-the BMC and the next `sol activate` then refuses to run. On a shared bench the
-opening `sol deactivate` also drops whoever else is attached.
+Every attach runs `sol deactivate` first, and again on the way out, because a
+session that ended any other way, such as a closed terminal or a dropped
+connection, leaves the payload open on the BMC and the next `sol activate` then
+refuses to run. On a shared bench the opening `sol deactivate` also drops
+whoever else is attached.
 
 That opening `sol deactivate` opens a session of its own, so a BMC that does not
 answer is reported there, in a few seconds, rather than by an attach that waits
 out ipmitool's full timeout a second time with the terminal already handed over.
 
 `ipmitool` runs on the RTE, as `flashrom` and the Tasmota `curl` do, so the BMC
-must be reachable from the RTE rather than from your PC. A SOL session over SSH
-disables ssh's own escape character, so that `~.` reaches ipmitool instead of
-dropping the SSH connection and stranding the payload. The cost is that `~.`
-cannot rescue the SSH session itself while SOL is attached.
+must be reachable from the RTE rather than from your PC. With
+`--detach-key none`, a SOL session over SSH still disables ssh's own escape
+character, so that `~.` reaches ipmitool instead of dropping the SSH connection
+and stranding the payload.
 
 `--source uart1` attaches read-only to a second debug UART some boards wire to
 the RTE separately from COM1, typically host firmware output running alongside
 the BMC's own console on COM1. There is nothing to type into it, so the attach
 is a plain `stty`-configured `cat` of the device rather than an interactive
-program, and detach is a plain Ctrl+C rather than an escape sequence. Boards
-without a wired UART1 report the command as not implemented. `--bmc-ip`,
-`--bmc-user`, and `--bmc-password` apply only with `--source sol`.
+program. Boards without a wired UART1 report the command as not implemented.
+`--bmc-ip`, `--bmc-user`, and `--bmc-password` apply only with `--source sol`.
 
 ## Platforms
 

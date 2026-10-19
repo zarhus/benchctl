@@ -9,10 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	osexec "os/exec"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestStreamReadsStdoutThenWaits(t *testing.T) {
@@ -218,4 +221,140 @@ func TestPullLocalReturnsSamePath(t *testing.T) {
 	if err := fetch(); err != nil {
 		t.Errorf("local Pull fetch returned error: %v", err)
 	}
+}
+
+func TestForwardUntilDropsTheKeyAndStops(t *testing.T) {
+	var dst bytes.Buffer
+	if !forwardUntil(&dst, strings.NewReader("ls\r\x1dquit\r"), 0x1D) {
+		t.Fatal("forwardUntil did not report the key")
+	}
+	if dst.String() != "ls\r" {
+		t.Errorf("forwarded %q, want the keys before the detach key only", dst.String())
+	}
+}
+
+func TestForwardUntilReportsTheEndOfInput(t *testing.T) {
+	var dst bytes.Buffer
+	if forwardUntil(&dst, strings.NewReader("ls\r"), 0x1D) {
+		t.Error("forwardUntil reported the key at the end of input")
+	}
+	if dst.String() != "ls\r" {
+		t.Errorf("forwarded %q, want all of it", dst.String())
+	}
+}
+
+// detachable runs argv locally under runDetachable, with keys read from a pipe
+// the test writes, and returns its result and output once it ends.
+func detachable(t *testing.T, keys string, argv ...string) (string, error) {
+	t.Helper()
+	in, keyboard, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { in.Close(); keyboard.Close() })
+	runner := &CmdRunner{Target: Target{Host: "localhost"}}
+	var out syncBuffer
+	done := make(chan error, 1)
+	go func() { done <- runner.runDetachable(argv, remoteTTYNoEscape, &out, in, 0x1D) }()
+	if _, err := keyboard.WriteString(keys); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		return out.String(), err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%q did not end after keys %q", argv, keys)
+		return "", nil
+	}
+}
+
+func TestRunDetachableStopsOnTheKey(t *testing.T) {
+	// The shell waits on a sleep that holds the output open. Stopping the shell
+	// alone would leave the sleep behind and the session waiting on it, as a
+	// local uart1 attach would on its cat.
+	_, err := detachable(t, "\x1d", "sh", "-c", "sleep 30; true")
+	if err != nil {
+		t.Errorf("runDetachable = %v, want nil for a session ended by the detach key", err)
+	}
+}
+
+func TestRunDetachablePassesOtherKeysThrough(t *testing.T) {
+	// The terminal is in its default line mode, so Enter ends the line.
+	out, err := detachable(t, "abc\r", "sh", "-c", `read -r line; echo "read:$line"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "read:abc") {
+		t.Errorf("output %q, want the program to read the keys typed", out)
+	}
+}
+
+func TestRunDetachableGivesTheProgramATerminal(t *testing.T) {
+	// ipmitool and telnet put their standard input into raw mode, which needs a
+	// terminal there.
+	out, err := detachable(t, "", "sh", "-c", "test -t 0 && test -t 1 && echo terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "terminal") {
+		t.Errorf("output %q, want the program to find a terminal", out)
+	}
+}
+
+func TestRunDetachableTurnsCtrlCIntoSIGINT(t *testing.T) {
+	// A plain cat ends on Ctrl+C, as it does in a shell.
+	_, err := detachable(t, "\x03", "cat")
+	if err == nil || !strings.Contains(err.Error(), "interrupt") {
+		t.Errorf("runDetachable = %v, want cat ended by SIGINT", err)
+	}
+}
+
+func TestRunDetachableReportsTheProgramsOwnFailure(t *testing.T) {
+	_, err := detachable(t, "", "sh", "-c", "exit 3")
+	if code, ran := ExitCode(err); !ran || code != 3 {
+		t.Errorf("runDetachable = %v, want exit status 3", err)
+	}
+}
+
+func TestRunInteractiveOutKeepsTheOrderWithADetachKey(t *testing.T) {
+	runner := &CmdRunner{Target: Target{Host: "localhost"}, DetachKey: DefaultDetachKey}
+	var buf bytes.Buffer
+
+	err := runner.RunInteractiveOut(&buf, "sh", "-c", "echo one; echo two >&2; echo three")
+	if err != nil {
+		t.Fatalf("RunInteractiveOut: %v", err)
+	}
+	// The terminal ends each line with CR LF, as on a screen.
+	if want := "one\r\ntwo\r\nthree\r\n"; buf.String() != want {
+		t.Errorf("output = %q, want %q", buf.String(), want)
+	}
+}
+
+func TestDetachHintNamesTheKey(t *testing.T) {
+	runner := &CmdRunner{DetachKey: DefaultDetachKey}
+	if got := runner.DetachHint(); got != "Ctrl+]" {
+		t.Errorf("DetachHint = %q, want Ctrl+]", got)
+	}
+	runner.DetachKey = 0
+	if got := runner.DetachHint(); got != "" {
+		t.Errorf("DetachHint with no key = %q, want empty", got)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe to read while a command writes it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

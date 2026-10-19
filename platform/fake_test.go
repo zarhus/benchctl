@@ -22,6 +22,7 @@ type fakeRunner struct {
 	streamOut      string // canned stdout for Stream
 	streamErr      error  // result of the Stream wait function
 	host           string // reported by Host()
+	detachHint     string // reported by DetachHint()
 	interactiveErr error
 	interactiveOut string // canned output written to RunInteractiveOut's out
 	// interactiveOutHandler, when set, scripts RunInteractiveOut per call
@@ -31,6 +32,8 @@ type fakeRunner struct {
 }
 
 func (fake *fakeRunner) Host() string { return fake.host }
+
+func (fake *fakeRunner) DetachHint() string { return fake.detachHint }
 
 func (fake *fakeRunner) Run(argv ...string) (string, error) {
 	callIndex := len(fake.calls)

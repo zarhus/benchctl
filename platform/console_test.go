@@ -47,6 +47,22 @@ func TestConsoleSessionAnnouncesTheDetachSequence(t *testing.T) {
 	}
 }
 
+func TestConsoleSessionAnnouncesTheRunnersDetachKey(t *testing.T) {
+	// With a detach key set the runner ends the session itself, so the line
+	// names that key instead of the program's own sequence.
+	runner := &fakeRunner{detachHint: "Ctrl+]"}
+	progress := &strings.Builder{}
+	if err := testSession().Run(runner, progress); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(progress.String(), "Detach with Ctrl+].") {
+		t.Errorf("progress = %q, want it to name the runner's detach key", progress)
+	}
+	if strings.Contains(progress.String(), "CTRL+A CTRL+X") {
+		t.Errorf("progress = %q, want the program's own sequence left out", progress)
+	}
+}
+
 func TestConsoleSessionReleasesAroundTheAttach(t *testing.T) {
 	runner := &fakeRunner{}
 	if err := testSession().Run(runner, &strings.Builder{}); err != nil {

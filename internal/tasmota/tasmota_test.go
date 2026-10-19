@@ -34,6 +34,8 @@ func (f *fakeRunner) RunInteractiveNoEscape(argv ...string) error { return nil }
 
 func (f *fakeRunner) RunInteractiveOut(out io.Writer, argv ...string) error { return nil }
 
+func (f *fakeRunner) DetachHint() string { return "" }
+
 func (f *fakeRunner) Stream(argv ...string) (io.ReadCloser, func() error, error) {
 	return io.NopCloser(strings.NewReader("")), func() error { return nil }, nil
 }

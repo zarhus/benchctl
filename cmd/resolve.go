@@ -20,6 +20,7 @@ type options struct {
 	board     string
 	tasmotaIP string
 	verbose   bool
+	detachKey string
 }
 
 // resolveHost returns the bench host from the flag, then BENCHCTL_HOST, and
@@ -74,6 +75,20 @@ func resolveBMCIP(flagVal string) string {
 	return os.Getenv("BENCHCTL_BMC_IP")
 }
 
+// resolveDetachKey returns the console detach key from the flag, then
+// BENCHCTL_DETACH_KEY, then Ctrl+]. "none" gives 0, which leaves detach to the
+// console program's own sequence.
+func resolveDetachKey(flagVal string) (byte, error) {
+	spec := flagVal
+	if spec == "" {
+		spec = os.Getenv("BENCHCTL_DETACH_KEY")
+	}
+	if spec == "" {
+		return exec.DefaultDetachKey, nil
+	}
+	return exec.ParseDetachKey(spec)
+}
+
 // resolvePassword returns the SSH password from the flag, then
 // BENCHCTL_PASSWORD, then the driver's default.
 func resolvePassword(flagVal, driverDefault string) string {
@@ -108,7 +123,11 @@ func build(opts options) (platform.Platform, error) {
 	if err := exec.CheckDependencies(target); err != nil {
 		return nil, err
 	}
-	runner := &exec.CmdRunner{Target: target, Verbose: opts.verbose}
+	detachKey, err := resolveDetachKey(opts.detachKey)
+	if err != nil {
+		return nil, err
+	}
+	runner := &exec.CmdRunner{Target: target, Verbose: opts.verbose, DetachKey: detachKey}
 	config := platform.Config{
 		Board:     resolveBoard(opts.board),
 		TasmotaIP: resolveTasmotaIP(opts.tasmotaIP),
