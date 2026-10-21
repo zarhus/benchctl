@@ -116,7 +116,8 @@ stick and sets a boot override to it:
    other file, or the kind `--medium` names. The insert task may take up to
    three minutes.
 1. The boot override is set to `Cd` or `Usb`, `Continuous` (`Once` with
-   `--boot-once`), in `UEFI` mode.
+   `--boot-once`), in `UEFI` mode where the BMC reports a mode. An OpenBMC BMC
+   without `BootSourceOverrideMode` fails a PATCH that sets it.
 1. `disk-ready` is printed on its own line. The host stays off, so a test runner
    can attach the console and then run `power on`. With `--power-on` the host is
    powered on before `disk-ready`.

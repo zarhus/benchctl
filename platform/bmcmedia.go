@@ -809,7 +809,7 @@ func (e *shortError) Error() string { return e.text }
 func (e *shortError) Unwrap() error { return e.err }
 
 // setBootOverride patches the system's boot override to target and enabled, in
-// UEFI mode.
+// UEFI mode where the BMC reports a mode.
 func (b *bmcPlatform) setBootOverride(ctx context.Context, target schemas.BootSource, enabled schemas.BootSourceOverrideEnabled) error {
 	return b.patchBoot(ctx, "set the boot override", func(boot schemas.Boot) (map[string]any, error) {
 		allowed := boot.AllowableBootSourceOverrideTargetValues
@@ -848,7 +848,8 @@ func (b *bmcPlatform) clearBootOverride() error {
 
 // patchBoot reads the system and PATCHes its Boot with the fields fields
 // returns, with If-Match from that read, and does nothing when fields returns
-// none. While the BMC answers that the host is booting, it retries for up to
+// none. BootSourceOverrideMode goes only to a BMC that reports it: an OpenBMC
+// BMC without the property answers 500 to a PATCH of it. While the BMC answers that the host is booting, it retries for up to
 // busyTimeout or until ctx ends. It goes through PatchWithHeaders: gofish's SetBoot retries a
 // failed PATCH on the settings object, which would hide the BMC's answer.
 func (b *bmcPlatform) patchBoot(ctx context.Context, what string, fields func(schemas.Boot) (map[string]any, error)) error {
@@ -861,6 +862,9 @@ func (b *bmcPlatform) patchBoot(ctx context.Context, what string, fields func(sc
 		boot, err := fields(system.Boot)
 		if boot == nil || err != nil {
 			return err
+		}
+		if !reportsBootMode(system) {
+			delete(boot, "BootSourceOverrideMode")
 		}
 		resp, err := b.media.PatchWithHeaders(system.ODataID, map[string]any{"Boot": boot}, system.Headers())
 		if err == nil {
@@ -880,6 +884,19 @@ func (b *bmcPlatform) patchBoot(ctx context.Context, what string, fields func(sc
 			return err
 		}
 	}
+}
+
+// reportsBootMode tells whether system's Boot has BootSourceOverrideMode, null
+// included.
+func reportsBootMode(system *schemas.ComputerSystem) bool {
+	var raw struct {
+		Boot map[string]json.RawMessage
+	}
+	if json.Unmarshal(system.RawData, &raw) != nil {
+		return true
+	}
+	_, ok := raw.Boot["BootSourceOverrideMode"]
+	return ok
 }
 
 // DiskEject ejects every inserted slot that has an EjectMedia action, or only

@@ -94,7 +94,8 @@ func amiMediaBMC() *mediaBMC {
 		manager:    "Self",
 		powerState: "On",
 		rmedia:     "Enabled",
-		boot:       map[string]any{},
+		// The bench reported all three override fields as null with none set.
+		boot: map[string]any{"BootSourceOverrideEnabled": nil, "BootSourceOverrideTarget": nil, "BootSourceOverrideMode": nil},
 		slots: []*fakeSlot{
 			{id: "CD1", types: []string{"CD"}, insert: true, eject: true},
 			{id: "CD2", types: []string{"CD"}, insert: true, eject: true},
@@ -110,7 +111,7 @@ func openBMCMediaBMC() *mediaBMC {
 		system:     "System_0",
 		manager:    "BMC_0",
 		powerState: "On",
-		boot:       map[string]any{"BootSourceOverrideEnabled": "Disabled", "BootSourceOverrideTarget": "None", "BootSourceOverrideMode": "UEFI"},
+		boot:       map[string]any{"BootSourceOverrideEnabled": "Disabled", "BootSourceOverrideTarget": "None"},
 		slots: []*fakeSlot{
 			{id: "Slot_0", types: both, eject: true, hidden: true},
 			{id: "USB1", types: both, insert: true, eject: true},
@@ -228,6 +229,15 @@ func (bmc *mediaBMC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			for _, required := range []string{"BootSourceOverrideTarget", "BootSourceOverrideMode"} {
 				if _, ok := boot[required]; !ok {
 					redfishFail(w, http.StatusBadRequest, "Base.1.12.PropertyMissing")
+					return
+				}
+			}
+		}
+		if !bmc.ami {
+			// OpenBMC fails a PATCH of a property it does not report.
+			for k := range boot {
+				if _, ok := bmc.boot[k]; !ok {
+					redfishFail(w, http.StatusInternalServerError, "Base.1.19.InternalError")
 					return
 				}
 			}
