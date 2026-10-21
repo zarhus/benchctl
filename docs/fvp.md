@@ -165,4 +165,7 @@ image, its medium and its size.
 
 The default is `virtio`, because an AHCI disk reproducibly crashes the reference
 UEFI on RD-V3 with a synchronous exception in `ArmCpuDxe`, whatever image is
-attached.
+attached. The `cd` and `usb` media, `--boot-once`, `--reset-bmc`, `--power-on`
+and `disk eject --slot` belong to the [BMC] driver and fail here.
+
+[bmc]: bmc.md

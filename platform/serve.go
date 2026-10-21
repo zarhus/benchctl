@@ -43,6 +43,26 @@ func unknownSource(name string) error {
 // console has held, for a launcher that waits on its output.
 const ConsoleReady = "console-ready"
 
+// DiskServer is a driver that attaches a local image by serving it while the
+// command runs in the foreground. Commands check for it with a type assertion.
+type DiskServer interface {
+	// DiskServe serves image, attaches it as DiskMount does, prints DiskReady,
+	// and serves until ctx ends. It then detaches the image and stops serving.
+	DiskServe(ctx context.Context, image string, opts DiskServeOptions) error
+}
+
+// DiskServeOptions is how DiskServe attaches and serves a local image.
+type DiskServeOptions struct {
+	DiskOptions
+	Listen   string // address the image server listens on, as ":8443"
+	MediaURL string // URL the BMC fetches the image under, without the file name; empty derives it
+}
+
+// DiskReady is the line the bmc driver's DiskMount and DiskServe print once the
+// image and the boot override are in place, and the host is on with PowerOn,
+// for a launcher that waits on its output.
+const DiskReady = "disk-ready"
+
 // consoleProcess is a running console attach: its output, its input, and a way
 // to end it.
 type consoleProcess = exec.PipedProcess

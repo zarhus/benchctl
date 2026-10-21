@@ -5,6 +5,9 @@
 package cmd
 
 import (
+	"context"
+	"strings"
+
 	"github.com/spf13/cobra"
 	"github.com/zarhus/benchctl/platform"
 )
@@ -15,44 +18,95 @@ func diskCmd() *cobra.Command {
 		Short: "Attach a disk/installer image for the host to boot from",
 	}
 
-	var mountMedium string
+	var (
+		mountMedium        string
+		listen, mediaURL   string
+		bootOnce, resetBMC bool
+		powerOn            bool
+	)
 	mount := &cobra.Command{
 		Use:   "mount <image>",
-		Short: "Record a disk image to attach from the next power on",
-		Args:  cobra.ExactArgs(1),
+		Short: "Attach a disk image for the host to boot from",
+		Long: `Attach a disk image for the host to boot from.
+
+On the fvp platform, disk mount records a local image to attach from the next
+power ac on.
+
+On the bmc platform, the BMC presents the image to the host as virtual media and
+a boot override boots it. disk mount powers the host off, attaches the image,
+sets the boot override and prints "disk-ready". The host stays off for the
+caller to attach the console and run power on, or disk mount powers it on
+before "disk-ready" with --power-on. A local file is served over HTTPS for the
+BMC to fetch: disk mount serves it until SIGINT or SIGTERM, then ejects it. An
+https:// or nfs:// URL goes to the BMC as it is, and disk mount returns after
+"disk-ready".
+
+A signal before "disk-ready" stops the mount at once while it waits, or after
+the insert or eject task it is following. A mount that stops or fails after
+the insert powers the host off, ejects the image and clears the boot override.
+
+--listen (or BENCHCTL_MEDIA_LISTEN) is the image server's address, :8443 by
+default. --media-url (or BENCHCTL_MEDIA_URL) is the URL the BMC fetches the
+file under, without the file name. By default it is https:// with this
+machine's address toward the BMC and the listen port. Some BMCs fetch only
+from port 443: listen on :443, or redirect 443 to the listen port and set
+--media-url without a port.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			medium, err := platform.ParseDiskMedium(mountMedium)
 			if err != nil {
 				return err
 			}
+			image := args[0]
+			opts := platform.DiskOptions{Medium: medium, BootOnce: bootOnce, ResetBMC: resetBMC, PowerOn: powerOn}
 			return withPlatform(func(p platform.Platform) error {
-				return p.DiskMount(args[0], medium)
+				server, ok := p.(platform.DiskServer)
+				if !ok {
+					return p.DiskMount(context.Background(), image, opts)
+				}
+				// A driver that serves images stops a mount on the first
+				// signal and undoes it.
+				ctx, stop := serveContext(func() {}, "benchctl: interrupted again, exiting without undoing the mount")
+				defer stop()
+				if strings.Contains(image, "://") {
+					return p.DiskMount(ctx, image, opts)
+				}
+				return server.DiskServe(ctx, image, platform.DiskServeOptions{
+					DiskOptions: opts,
+					Listen:      resolveSettingOr(listen, "BENCHCTL_MEDIA_LISTEN", ":8443"),
+					MediaURL:    resolveSetting(mediaURL, "BENCHCTL_MEDIA_URL"),
+				})
 			})
 		},
 	}
-	// virtio is the default rather than ahci: on rdv3, mounting an image via
-	// pcie_group_0.pcie4.pcie_rc.ahci0.ahci.image_path reproducibly hits a
-	// Synchronous Exception in the reference UEFI's ArmCpuDxe (identical
-	// PC/registers regardless of the attached image's own content - Ubuntu
-	// Desktop and Alpine both crash at exactly the same instruction), which
-	// points at the AHCI probe/enumeration path itself, not the guest image.
-	// See examples/rdv3-coreboot-linuxboot/kb/rdv3.md's D6 section.
-	mount.Flags().StringVar(&mountMedium, "medium", "virtio", "how the image is presented to the host: virtio (virtio-blk) or ahci (SATA/AHCI - known to crash the reference UEFI on rdv3, see kb/rdv3.md)")
+	flags := mount.Flags()
+	flags.StringVar(&mountMedium, "medium", "", "how the image is presented to the host: virtio or ahci on fvp (default virtio, ahci is known to crash the reference UEFI on rdv3, see kb/rdv3.md), cd or usb on bmc (default cd for .iso, usb otherwise)")
+	flags.StringVar(&listen, "listen", "", "`address` the image server listens on (or BENCHCTL_MEDIA_LISTEN; default :8443)")
+	flags.StringVar(&mediaURL, "media-url", "", "`URL` the BMC fetches the image under, without the file name (or BENCHCTL_MEDIA_URL)")
+	flags.BoolVar(&bootOnce, "boot-once", false, "boot the image once instead of until disk eject")
+	flags.BoolVar(&resetBMC, "reset-bmc", false, "reset the BMC once if it offers no media slots")
+	flags.BoolVar(&powerOn, "power-on", false, "power the host on once the image and the boot override are in place")
 
+	var slot string
 	eject := &cobra.Command{
 		Use:   "eject",
-		Short: "Forget the recorded disk image",
-		Args:  cobra.NoArgs,
+		Short: "Detach the disk image",
+		Long: `Detach the disk image.
+
+On the bmc platform, disk eject ejects every inserted virtual media slot that
+has an EjectMedia action, or only --slot, and clears the boot override.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withPlatform(func(p platform.Platform) error {
-				return p.DiskEject()
+				return p.DiskEject(slot)
 			})
 		},
 	}
+	eject.Flags().StringVar(&slot, "slot", "", "eject only the virtual media slot with this `ID`")
 
 	status := &cobra.Command{
 		Use:   "status",
-		Short: "Show the recorded disk image, if any",
+		Short: "Show the attached or recorded disk image",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withPlatform(func(p platform.Platform) error {

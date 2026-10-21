@@ -9,7 +9,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/zarhus/benchctl/platform"
 )
@@ -30,7 +32,7 @@ type fakePlatform struct {
 	uart1     bool
 	diskErr   error
 	mounted   []string // "<image> <medium>" per DiskMount call, in order
-	ejected   bool
+	ejected   *string  // the slot DiskEject got
 }
 
 func (fake *fakePlatform) PowerState() (platform.PowerStatus, error) { return fake.state, nil }
@@ -63,12 +65,49 @@ func (fake *fakePlatform) FlashStatus(platform.FlashTarget) (platform.Status, er
 }
 func (fake *fakePlatform) FlashAbort(platform.FlashTarget) error { return nil }
 
-func (fake *fakePlatform) DiskMount(image string, medium platform.DiskMedium) error {
-	fake.mounted = append(fake.mounted, image+" "+medium.String())
+func (fake *fakePlatform) DiskMount(_ context.Context, image string, opts platform.DiskOptions) error {
+	fake.mounted = append(fake.mounted, image+" "+opts.Medium.String())
 	return fake.diskErr
 }
-func (fake *fakePlatform) DiskEject() error  { fake.ejected = true; return fake.diskErr }
-func (fake *fakePlatform) DiskStatus() error { return fake.diskErr }
+func (fake *fakePlatform) DiskEject(slot string) error { fake.ejected = &slot; return fake.diskErr }
+func (fake *fakePlatform) DiskStatus() error           { return fake.diskErr }
+
+// fakeDiskServer is a platform that serves local images, as the bmc driver
+// does.
+type fakeDiskServer struct {
+	fakePlatform
+	served    []string // "<image>" per DiskServe call
+	opts      platform.DiskServeOptions
+	interrupt bool // DiskMount and DiskServe send this process SIGINT and wait for ctx to end
+	ended     bool // ctx ended within a second of the SIGINT
+}
+
+func (fake *fakeDiskServer) DiskMount(ctx context.Context, image string, opts platform.DiskOptions) error {
+	fake.mounted = append(fake.mounted, image+" "+opts.Medium.String())
+	return fake.waitInterrupt(ctx)
+}
+
+func (fake *fakeDiskServer) DiskServe(ctx context.Context, image string, opts platform.DiskServeOptions) error {
+	fake.served = append(fake.served, image)
+	fake.opts = opts
+	return fake.waitInterrupt(ctx)
+}
+
+// waitInterrupt sends this process SIGINT when interrupt is set and records
+// whether ctx ends.
+func (fake *fakeDiskServer) waitInterrupt(ctx context.Context) error {
+	if fake.interrupt {
+		if err := syscall.Kill(syscall.Getpid(), syscall.SIGINT); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			fake.ended = true
+		case <-time.After(time.Second):
+		}
+	}
+	return fake.diskErr
+}
 
 func withFakePlatform(t *testing.T, driver platform.Platform) {
 	t.Helper()
@@ -121,13 +160,13 @@ func TestFlashWriteBMCPropagatesNotImplemented(t *testing.T) {
 	}
 }
 
-func TestDiskMountDefaultsToVirtio(t *testing.T) {
+func TestDiskMountLeavesTheMediumToTheDriver(t *testing.T) {
 	fake := &fakePlatform{}
 	withFakePlatform(t, fake)
 	if _, err := run(t, "disk", "mount", "ubuntu.iso"); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"ubuntu.iso virtio"}; len(fake.mounted) != 1 || fake.mounted[0] != want[0] {
+	if want := []string{"ubuntu.iso default"}; len(fake.mounted) != 1 || fake.mounted[0] != want[0] {
 		t.Errorf("disk mount calls = %v, want %v", fake.mounted, want)
 	}
 }
@@ -145,8 +184,8 @@ func TestDiskMountMediumFlag(t *testing.T) {
 
 func TestDiskMountRejectsUnknownMedium(t *testing.T) {
 	withFakePlatform(t, &fakePlatform{})
-	if _, err := run(t, "disk", "mount", "ubuntu.iso", "--medium", "usb"); err == nil {
-		t.Error("disk mount --medium usb: want an error, got nil")
+	if _, err := run(t, "disk", "mount", "ubuntu.iso", "--medium", "floppy"); err == nil {
+		t.Error("disk mount --medium floppy: want an error, got nil")
 	}
 }
 
@@ -156,8 +195,59 @@ func TestDiskEject(t *testing.T) {
 	if _, err := run(t, "disk", "eject"); err != nil {
 		t.Fatal(err)
 	}
-	if !fake.ejected {
-		t.Error("disk eject: DiskEject was not called")
+	if fake.ejected == nil || *fake.ejected != "" {
+		t.Errorf("disk eject: DiskEject got %v, want a call with no slot", fake.ejected)
+	}
+	if _, err := run(t, "disk", "eject", "--slot", "CD1"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.ejected == nil || *fake.ejected != "CD1" {
+		t.Errorf("disk eject --slot CD1: DiskEject got %v, want CD1", fake.ejected)
+	}
+}
+
+func TestDiskMountServesALocalFileOnADiskServer(t *testing.T) {
+	t.Setenv("BENCHCTL_MEDIA_LISTEN", "")
+	t.Setenv("BENCHCTL_MEDIA_URL", "https://10.0.0.9/")
+	fake := &fakeDiskServer{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "disk", "mount", "debian.iso", "--boot-once", "--power-on"); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.served) != 1 || fake.served[0] != "debian.iso" || len(fake.mounted) != 0 {
+		t.Fatalf("served = %q, mounted = %q, want debian.iso served", fake.served, fake.mounted)
+	}
+	want := platform.DiskServeOptions{
+		DiskOptions: platform.DiskOptions{BootOnce: true, PowerOn: true},
+		Listen:      ":8443",
+		MediaURL:    "https://10.0.0.9/",
+	}
+	if fake.opts != want {
+		t.Errorf("DiskServe options = %+v, want %+v", fake.opts, want)
+	}
+}
+
+func TestDiskMountEndsItsContextOnSIGINT(t *testing.T) {
+	for _, image := range []string{"debian.iso", "https://images.example/debian.iso"} {
+		fake := &fakeDiskServer{interrupt: true}
+		withFakePlatform(t, fake)
+		if _, err := run(t, "disk", "mount", image); err != nil {
+			t.Fatal(err)
+		}
+		if !fake.ended {
+			t.Errorf("disk mount %s: the context did not end on SIGINT", image)
+		}
+	}
+}
+
+func TestDiskMountPassesAURLToDiskMount(t *testing.T) {
+	fake := &fakeDiskServer{}
+	withFakePlatform(t, fake)
+	if _, err := run(t, "disk", "mount", "https://images.example/debian.iso", "--medium", "usb", "--listen", ":9443"); err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://images.example/debian.iso usb"; len(fake.mounted) != 1 || fake.mounted[0] != want || len(fake.served) != 0 {
+		t.Errorf("mounted = %q, served = %q, want %q mounted", fake.mounted, fake.served, want)
 	}
 }
 

@@ -8,6 +8,7 @@
 package platform
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -75,37 +76,62 @@ type Status struct {
 	ID    string
 }
 
-// DiskMedium selects how a mounted disk image is presented to the host -
-// meaningful mainly to a platform (like fvp) that can model more than one
-// attachment point; a platform with a single fixed one is free to ignore it.
+// DiskMedium selects how a mounted disk image is presented to the host.
+// DiskDefault leaves the choice to the driver: the FVP attaches virtio-blk, and
+// the bmc driver picks CD for an ISO and USB otherwise. A driver refuses a
+// medium it cannot present.
 type DiskMedium int
 
 const (
-	DiskAHCI   DiskMedium = iota // SATA/AHCI, e.g. an installer ISO or disk image
-	DiskVirtio                   // virtio-blk
+	DiskDefault DiskMedium = iota // the driver's own choice
+	DiskAHCI                      // SATA/AHCI, e.g. an installer ISO or disk image
+	DiskVirtio                    // virtio-blk
+	DiskCD                        // a BMC's virtual CD
+	DiskUSB                       // a BMC's virtual USB stick
 )
 
 func (medium DiskMedium) String() string {
 	switch medium {
+	case DiskDefault:
+		return "default"
 	case DiskAHCI:
 		return "ahci"
 	case DiskVirtio:
 		return "virtio"
+	case DiskCD:
+		return "cd"
+	case DiskUSB:
+		return "usb"
 	default:
 		return "unknown"
 	}
 }
 
-// ParseDiskMedium maps a CLI-facing name to a DiskMedium.
+// ParseDiskMedium maps a CLI-facing name to a DiskMedium. Empty is
+// DiskDefault.
 func ParseDiskMedium(name string) (DiskMedium, error) {
 	switch name {
+	case "":
+		return DiskDefault, nil
 	case "ahci":
 		return DiskAHCI, nil
 	case "virtio":
 		return DiskVirtio, nil
+	case "cd":
+		return DiskCD, nil
+	case "usb":
+		return DiskUSB, nil
 	default:
-		return 0, fmt.Errorf("unknown disk medium %q (want ahci or virtio)", name)
+		return 0, fmt.Errorf("unknown disk medium %q (want ahci, virtio, cd or usb)", name)
 	}
+}
+
+// DiskOptions is how disk mount attaches an image.
+type DiskOptions struct {
+	Medium   DiskMedium
+	BootOnce bool // boot the image once, where the platform sets a boot override
+	ResetBMC bool // reset the BMC once when it offers no media slots
+	PowerOn  bool // power the host on once the image is attached
 }
 
 // BMC addresses a baseboard management controller over IPMI. The caller supplies
@@ -134,9 +160,9 @@ type Platform interface {
 	FlashWrite(t FlashTarget, fw string, force bool) error
 	FlashStatus(t FlashTarget) (Status, error)
 	FlashAbort(t FlashTarget) error
-	DiskMount(image string, medium DiskMedium) error // record a disk image to attach on the next power on
-	DiskEject() error                                // forget the recorded disk image
-	DiskStatus() error                               // report the recorded disk image, if any
+	DiskMount(ctx context.Context, image string, opts DiskOptions) error // attach a disk image, or record it for the next power on, stopping when ctx ends
+	DiskEject(slot string) error                                         // detach the image, from slot only when it is set
+	DiskStatus() error                                                   // report the attached or recorded disk image
 }
 
 // Config carries resolved, driver-agnostic options into a driver constructor.

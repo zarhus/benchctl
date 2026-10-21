@@ -792,11 +792,11 @@ func (bench *benchRack) FlashAbort(FlashTarget) error {
 // This board has no media-mount control (no virtual CD/USB path), the same
 // way it has no AC control on boards with no Tasmota plug - so, like
 // ACPowerState and friends, these just report ErrNotImplemented.
-func (bench *benchRack) DiskMount(image string, medium DiskMedium) error {
+func (bench *benchRack) DiskMount(context.Context, string, DiskOptions) error {
 	return ErrNotImplemented
 }
 
-func (bench *benchRack) DiskEject() error {
+func (bench *benchRack) DiskEject(slot string) error {
 	return ErrNotImplemented
 }
 

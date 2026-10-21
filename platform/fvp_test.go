@@ -7,6 +7,7 @@ package platform
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -672,6 +673,48 @@ func TestFlashTargetBMCNotImplemented(t *testing.T) {
 	}
 	if err := fv.FlashRead(FlashBMC, filepath.Join(dir, "out")); err != ErrNotImplemented {
 		t.Fatalf("FlashRead(bmc) = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestDiskMountDefaultsToVirtio(t *testing.T) {
+	dir := t.TempDir()
+	fv := testPlatform(t, writeScript(t, dir, "model.sh", "#!/bin/sh\nexit 0\n"))
+	image := filepath.Join(dir, "disk.img")
+	if err := os.WriteFile(image, []byte("disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := fv.DiskMount(context.Background(), image, DiskOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	medium, path, ok := fv.currentDisk()
+	if !ok || medium != DiskVirtio || path != image {
+		t.Errorf("recorded disk = %v %q %v, want virtio %q", medium, path, ok, image)
+	}
+}
+
+func TestDiskRefusesWhatTheModelCannotPresent(t *testing.T) {
+	dir := t.TempDir()
+	fv := testPlatform(t, writeScript(t, dir, "model.sh", "#!/bin/sh\nexit 0\n"))
+	image := filepath.Join(dir, "debian.iso")
+	if err := os.WriteFile(image, []byte("iso"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, opts := range map[string]DiskOptions{
+		"cd":        {Medium: DiskCD},
+		"usb":       {Medium: DiskUSB},
+		"boot once": {BootOnce: true},
+		"power on":  {PowerOn: true},
+		"BMC reset": {ResetBMC: true},
+	} {
+		if err := fv.DiskMount(context.Background(), image, opts); err == nil {
+			t.Errorf("DiskMount with %s: want an error, got nil", name)
+		}
+	}
+	if _, _, ok := fv.currentDisk(); ok {
+		t.Error("a refused DiskMount recorded a disk")
+	}
+	if err := fv.DiskEject("CD1"); err == nil {
+		t.Error("DiskEject(CD1): want an error, got nil")
 	}
 }
 

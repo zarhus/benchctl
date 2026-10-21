@@ -54,29 +54,29 @@ describe each driver.
 
 ## Commands
 
-| Command                                      | What it does                                            |
-| -------------------------------------------- | ------------------------------------------------------- |
-| `power on`                                   | powers the host on and waits until it is on             |
-| `power off`                                  | powers the host off and waits until it is off           |
-| `power status`                               | prints the current power state                          |
-| `power reset`                                | power-cycles the host off then on, waits until it is on |
-| `power reset --hard`                         | hard-resets the host, the mechanism varies by platform  |
-| `power ac on` / `off`                        | applies or removes mains (AC) power                     |
-| `power ac cycle`                             | removes mains, waits briefly, applies it again          |
-| `power ac status`                            | prints whether mains is applied                         |
-| `console`                                    | attaches to the host serial console (COM1)              |
-| `console --source sol`                       | attaches to the host console over the BMC's IPMI SOL    |
-| `console --source uart1`                     | attaches read-only to the UART1 debug console           |
-| `console --serve <addr>`                     | relays the console on a loopback TCP address            |
-| `flash probe <host\|bmc>`                    | detects and prints the flash chip                       |
-| `flash read <host\|bmc> <file>`              | reads the flash into `<file>`                           |
-| `flash write <host\|bmc> <fw> [--force]`     | writes firmware to the flash                            |
-| `flash status [host\|bmc]`                   | shows the update status, host by default                |
-| `flash abort [host\|bmc]`                    | aborts a stuck or stale update, host by default         |
-| `disk mount <image> [--medium virtio\|ahci]` | records a disk image to attach from the next power on   |
-| `disk eject`                                 | forgets the recorded disk image                         |
-| `disk status`                                | shows the recorded disk image                           |
-| `--version`                                  | prints the build's commit and its default platform      |
+| Command                                  | What it does                                            |
+| ---------------------------------------- | ------------------------------------------------------- |
+| `power on`                               | powers the host on and waits until it is on             |
+| `power off`                              | powers the host off and waits until it is off           |
+| `power status`                           | prints the current power state                          |
+| `power reset`                            | power-cycles the host off then on, waits until it is on |
+| `power reset --hard`                     | hard-resets the host, the mechanism varies by platform  |
+| `power ac on` / `off`                    | applies or removes mains (AC) power                     |
+| `power ac cycle`                         | removes mains, waits briefly, applies it again          |
+| `power ac status`                        | prints whether mains is applied                         |
+| `console`                                | attaches to the host serial console (COM1)              |
+| `console --source sol`                   | attaches to the host console over the BMC's IPMI SOL    |
+| `console --source uart1`                 | attaches read-only to the UART1 debug console           |
+| `console --serve <addr>`                 | relays the console on a loopback TCP address            |
+| `flash probe <host\|bmc>`                | detects and prints the flash chip                       |
+| `flash read <host\|bmc> <file>`          | reads the flash into `<file>`                           |
+| `flash write <host\|bmc> <fw> [--force]` | writes firmware to the flash                            |
+| `flash status [host\|bmc]`               | shows the update status, host by default                |
+| `flash abort [host\|bmc]`                | aborts a stuck or stale update, host by default         |
+| `disk mount <image> [--medium <medium>]` | attaches a disk image for the host to boot from         |
+| `disk eject [--slot <id>]`               | detaches the disk image                                 |
+| `disk status`                            | shows the attached or recorded disk image               |
+| `--version`                              | prints the build's commit and its default platform      |
 
 benchctl exits with 0 on success, 3 when the selected platform does not
 implement the operation, and 1 on any other error. A script can tell
@@ -94,7 +94,7 @@ implements, and `-` marks a command that exits with 3.
 | `console --serve`              | yes               | -                      | yes, `com1` and `sol` |
 | `flash probe`, `read`, `write` | yes               | `host` only            | -                     |
 | `flash status`, `abort`        | -                 | -                      | -                     |
-| `disk`                         | -                 | yes                    | -                     |
+| `disk`                         | -                 | yes, from next start   | yes, virtual media    |
 
 The [consoles] page covers the console sources, detaching and `--serve`.
 

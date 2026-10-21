@@ -17,9 +17,10 @@ import (
 )
 
 // serveContext returns a context that SIGINT or SIGTERM ends, for console
-// --serve to release the console and exit. A second signal restores the
-// terminal with restoreEcho and exits at once, for a release that hangs.
-func serveContext(restoreEcho func()) (context.Context, context.CancelFunc) {
+// --serve or disk mount to release what they hold and exit. A second signal
+// restores the terminal with restoreEcho, prints message and exits at once, for
+// a release that hangs.
+func serveContext(restoreEcho func(), message string) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
@@ -28,7 +29,7 @@ func serveContext(restoreEcho func()) (context.Context, context.CancelFunc) {
 		cancel()
 		<-signals
 		restoreEcho()
-		fmt.Fprintln(os.Stderr, "benchctl: interrupted again, exiting without releasing the console")
+		fmt.Fprintln(os.Stderr, message)
 		os.Exit(1)
 	}()
 	return ctx, func() {
@@ -98,7 +99,7 @@ at the start of a line for sol, Ctrl+C for uart1.`,
 					// Keys pressed here reach no console, so the terminal does not echo them.
 					restoreEcho := exec.NoEcho(os.Stdin)
 					defer restoreEcho()
-					ctx, stop := serveContext(restoreEcho)
+					ctx, stop := serveContext(restoreEcho, "benchctl: interrupted again, exiting without releasing the console")
 					defer stop()
 					return server.ConsoleServe(ctx, serve, chosen)
 				}

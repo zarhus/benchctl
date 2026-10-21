@@ -8,10 +8,10 @@ SPDX-License-Identifier: Apache-2.0
 
 The `bmc` driver drives a host through its BMC alone, from your PC: host power
 over Redfish and the host console over the BMC's SSH console, with IPMI SOL as
-the fallback. It is for a machine that sits on no bench, such as one reached
-through an ssh jump host on someone else's network. It leaves AC power, flash
-and disks alone: `power ac`, `flash` and `disk mount`/`eject`/`status` report
-"not implemented". `--host` is `localhost`.
+the fallback, and disk images as the BMC's virtual media. It is for a machine
+that sits on no bench, such as one reached through an ssh jump host on someone
+else's network. It leaves AC power and flash alone: `power ac` and `flash`
+report "not implemented". `--host` is `localhost`.
 
 | Setting           | Flag                  | Environment                  | Default                         |
 | ----------------- | --------------------- | ---------------------------- | ------------------------------- |
@@ -96,6 +96,104 @@ not implemented.
 
 `console --serve` relays this console, or SOL with `--source sol`, for a test
 framework, as the [consoles] page describes.
+
+## Virtual media
+
+`disk mount` has the BMC present an image to the host as a read-only CD or USB
+stick and sets a boot override to it:
+
+1. A local file is served over HTTPS from this machine, see "Image server". An
+   `https://` or `nfs://` URL goes to the BMC as it is.
+1. Remote media is switched on where an AMI BMC reports it off, through the
+   manager's `EnableRMedia` action, and the driver waits up to a minute for
+   slots that take `InsertMedia`.
+1. The host is powered off (`ForceOff`).
+1. Every inserted slot with an `EjectMedia` action is ejected.
+1. The image goes into a free CD slot for an `.iso` and a USB stick slot for any
+   other file, or the kind `--medium` names. The insert task may take up to
+   three minutes.
+1. The boot override is set to `Cd` or `Usb`, `Continuous` (`Once` with
+   `--boot-once`), in `UEFI` mode.
+1. `disk-ready` is printed on its own line. The host stays off, so a test runner
+   can attach the console and then run `power on`. With `--power-on` the host is
+   powered on before `disk-ready`.
+1. A local file is served until SIGINT or SIGTERM. Then the driver ejects its
+   slot and clears the boot override. A second signal exits at once. A URL mount
+   returns after `disk-ready`.
+
+A signal before `disk-ready` stops the mount at once while it waits for slots,
+power or the BMC, and after the insert or eject task it is following, so the
+undo sees where the media ended up. When the mount stops or fails after the
+insert, the driver powers the host off, so that AMI takes the override PATCH,
+then ejects the slots and clears the boot override as `disk eject` does.
+`disk eject` clears the override even when an eject fails.
+
+`disk eject` ejects every inserted slot with an `EjectMedia` action, or only
+`--slot`, and sets the boot override to `Disabled`. Slots without the action,
+such as an OpenBMC proxy slot or one the BMC's web console fills, belong to
+another session and stay as they are. `disk status` lists the slots, the boot
+override and, on AMI, the remote media status.
+
+| Setting        | Flag          | Environment             | Default                                    |
+| -------------- | ------------- | ----------------------- | ------------------------------------------ |
+| Media type     | `--medium`    | none                    | `cd` for `.iso`, `usb` otherwise           |
+| Server address | `--listen`    | `BENCHCTL_MEDIA_LISTEN` | `:8443`                                    |
+| Image URL base | `--media-url` | `BENCHCTL_MEDIA_URL`    | `https://<address toward the BMC>:<port>/` |
+| One boot only  | `--boot-once` | none                    | off, the override stays until eject        |
+| Reset the BMC  | `--reset-bmc` | none                    | off                                        |
+| Power on       | `--power-on`  | none                    | off, the host stays off                    |
+| Slot to eject  | `--slot`      | none                    | every inserted slot                        |
+
+```sh
+bin/benchctl disk mount debian-13.7.0-amd64-netinst.iso   # serves until Ctrl+C
+bin/benchctl disk mount https://images.example/disk.img --boot-once --power-on
+bin/benchctl disk status
+bin/benchctl disk eject
+```
+
+### Image server
+
+The server answers `HEAD` and byte ranges for the one file, at `/<file name>`
+below the path of `--media-url`, with a self-signed certificate made for each
+run. It logs the first request from each address, then the request count and
+bytes served every 30 seconds while requests arrive.
+
+The default URL uses the address this machine sends from toward the BMC. Through
+a jump host that address belongs to the jump host's side, so `--media-url` is
+required there, and the BMC has to reach this machine in any case. Some BMCs,
+the AMI MegaRAC tested among them, fetch only from port 443. Either listen on
+`:443`, which takes root, `cap_net_bind_service` or
+`net.ipv4.ip_unprivileged_port_start=443`, or redirect 443 to the listen port
+with iptables or nftables and set `--media-url` without a port. When the insert
+fails after the BMC took the request, and the server saw no request, the error
+lists these ways through. For a URL benchctl does not serve, AMI's
+`InsertMediaError` brings up a shorter hint that names the port. A BMC that
+refuses the `InsertMedia` request itself gets no hint, since it fetched nothing.
+The AMI bench refuses an `.iso` URL on a USB stick slot that way.
+
+### BMC rules
+
+- Slots come from the `VirtualMedia` links of the system and its managers. A
+  slot fits by its `MediaTypes`, or by an ID that starts with `CD` or `USBStick`
+  when it lists none.
+- `InsertMedia` carries `TransferProtocolType` from the URL scheme, empty
+  `UserName` and `Password` for HTTPS, and `MediaType` when the action's
+  `ActionInfo` lists it. The driver follows a task until it completes and
+  reports its messages when it ends in `Exception`.
+- AMI moves media to the first free slot and reports the image as `//host/path`,
+  so after the insert the driver finds the slot by host and path. It requests an
+  image at the root of the server as `//<file name>`, and the image server
+  cleans the path before it matches it.
+- The boot override PATCH carries `If-Match` from a fresh GET and only the
+  `Boot` fields it sets. AMI requires `BootSourceOverrideTarget` and
+  `BootSourceOverrideMode` in every boot PATCH, so clearing the override sends
+  `Disabled` with the target `None`. AMI reports no override as `null`, and the
+  driver then sends no PATCH. AMI answers 503 while the host boots, and the
+  driver retries for up to a minute.
+- With no slots after remote media is on, the mount fails. `--reset-bmc` then
+  posts `Manager.Reset` `ForceRestart`, waits up to five minutes for Redfish to
+  go away and answer again, and tries once more. Consoles attached through the
+  BMC drop with the reset.
 
 ## Dependencies
 

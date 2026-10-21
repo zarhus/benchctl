@@ -20,7 +20,7 @@ development.
 | `cmd/`              | cobra commands, flag and environment resolution (`resolve.go`), exit codes   |
 | `platform/`         | the `Platform` interface, the registry, the drivers, console sessions, relay |
 | `exec/`             | runs commands locally or over SSH, scp, detach keys, terminal handling       |
-| `internal/redfish/` | Redfish client and the ssh `-W` transport through a jump host                |
+| `internal/redfish/` | Redfish client for power and the ssh `-W` transport through a jump host      |
 | `internal/ipmi/`    | builds `ipmitool` SOL commands                                               |
 | `internal/iris/`    | minimal client for the FVP model's Iris protocol                             |
 | `internal/rte/`     | RTE REST client for GPIO                                                     |
@@ -42,6 +42,9 @@ run the same Go checks plus mdformat (`--wrap 80`), codespell and `reuse lint`.
 - An unsupported operation returns `platform.ErrNotImplemented`, which exits
   with status 3. Optional capabilities are separate interfaces checked with a
   type assertion, as `platform.ConsoleServer` is for `console --serve`.
+- The `bmc` driver's virtual media (`platform/bmcmedia.go`) uses gofish over the
+  same HTTP client as `internal/redfish`, and benchctl's own code for tasks, the
+  boot override and vendor rules gofish handles differently.
 - Bench commands go through `exec.Runner`, so the same code runs on the bench
   and over SSH from a PC.
 - Error messages are lower case, wrap causes with `%w`, and name the flag or

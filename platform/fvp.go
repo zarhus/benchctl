@@ -7,6 +7,7 @@ package platform
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -1294,9 +1295,27 @@ func (fv *fvpPlatform) currentDisk() (medium DiskMedium, path string, ok bool) {
 // running model already has whatever was attached at its own launch, so a
 // mount only takes effect from the next start(). It powers the model off
 // first so that effect is unambiguous rather than silently deferred.
-func (fv *fvpPlatform) DiskMount(image string, medium DiskMedium) error {
+func (fv *fvpPlatform) DiskMount(_ context.Context, image string, opts DiskOptions) error {
 	if fv.configErr != nil {
 		return fv.configErr
+	}
+	medium := opts.Medium
+	switch medium {
+	case DiskDefault:
+		// virtio is the default rather than ahci: on rdv3, mounting an image via
+		// pcie_group_0.pcie4.pcie_rc.ahci0.ahci.image_path reproducibly hits a
+		// Synchronous Exception in the reference UEFI's ArmCpuDxe (identical
+		// PC/registers regardless of the attached image's own content - Ubuntu
+		// Desktop and Alpine both crash at exactly the same instruction), which
+		// points at the AHCI probe/enumeration path itself, not the guest image.
+		// See examples/rdv3-coreboot-linuxboot/kb/rdv3.md's D6 section.
+		medium = DiskVirtio
+	case DiskAHCI, DiskVirtio:
+	default:
+		return fmt.Errorf("the fvp platform attaches disks as virtio or ahci, not %s", medium)
+	}
+	if opts.BootOnce || opts.ResetBMC || opts.PowerOn {
+		return fmt.Errorf("the fvp platform has no boot override or BMC and starts the model on power on: --boot-once, --reset-bmc and --power-on do not apply")
 	}
 	abs, err := filepath.Abs(image)
 	if err != nil {
@@ -1327,9 +1346,12 @@ func (fv *fvpPlatform) DiskMount(image string, medium DiskMedium) error {
 // off first (see its comment on why SetPower cannot substitute here) so the
 // removal takes effect unambiguously from the next launch rather than
 // silently applying to an already-running model.
-func (fv *fvpPlatform) DiskEject() error {
+func (fv *fvpPlatform) DiskEject(slot string) error {
 	if fv.configErr != nil {
 		return fv.configErr
+	}
+	if slot != "" {
+		return fmt.Errorf("the fvp platform has one disk and no slots: drop --slot")
 	}
 	if err := fv.SetACPower(PowerOff); err != nil {
 		return err

@@ -82,7 +82,7 @@ func (bmc *fakeBMC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // newTestBMC starts bmc over TLS and returns a driver that reaches it.
-func newTestBMC(t *testing.T, bmc *fakeBMC, access BMCAccess, runner *fakeRunner) (*bmcPlatform, *syncWriter) {
+func newTestBMC(t *testing.T, bmc http.Handler, access BMCAccess, runner *fakeRunner) (*bmcPlatform, *syncWriter) {
 	t.Helper()
 	server := httptest.NewTLSServer(bmc)
 	t.Cleanup(server.Close)
@@ -316,7 +316,6 @@ func TestBMCLeavesACAndFlashAlone(t *testing.T) {
 		"ACPowerCycle": driver.ACPowerCycle(),
 		"FlashWrite":   driver.FlashWrite(FlashHost, "fw.bin", false),
 		"ConsoleUART1": driver.ConsoleUART1(),
-		"DiskMount":    driver.DiskMount("disk.img", DiskAHCI),
 	} {
 		if !errors.Is(err, ErrNotImplemented) {
 			t.Errorf("%s = %v, want ErrNotImplemented", name, err)

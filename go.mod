@@ -9,6 +9,7 @@ go 1.25.11
 require (
 	github.com/creack/pty v1.1.24
 	github.com/spf13/cobra v1.10.2
+	github.com/stmcginnis/gofish v0.27.1-0.20261014173901-622414f35f24
 	golang.org/x/sys v0.41.0
 	golang.org/x/term v0.40.0
 )

@@ -6,6 +6,7 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stmcginnis/gofish"
 	"github.com/zarhus/benchctl/exec"
 	"github.com/zarhus/benchctl/internal/ipmi"
 	"github.com/zarhus/benchctl/internal/redfish"
@@ -33,8 +35,8 @@ func init() {
 // workstation and reaches the BMC directly or through an ssh jump host, with
 // ProxyJump, keys and agent taken from the user's OpenSSH configuration.
 //
-// The driver exposes host power on, off and reset only. AC power and flash
-// writes stay with whoever owns the machine.
+// It also attaches disk images as the BMC's virtual media, in bmcmedia.go. AC
+// power and flash writes stay with whoever owns the machine.
 type bmcPlatform struct {
 	runner    exec.Runner
 	access    BMCAccess
@@ -42,13 +44,20 @@ type bmcPlatform struct {
 	configErr error
 
 	redfish    *redfish.Client
-	systemPath string // resolved on first use
+	systemPath string            // resolved on first use
+	media      *gofish.APIClient // virtual media client, connected on first use
+	out        io.Writer         // disk status output
 
-	pollEvery    time.Duration
-	powerTimeout time.Duration
-	setenv       func(key, value string) error
-	startPiped   func(argv []string) (consoleProcess, error)
-	probeSSH     func(port int) error
+	pollEvery       time.Duration
+	powerTimeout    time.Duration
+	slotsTimeout    time.Duration // remote media and its slots appearing
+	insertTimeout   time.Duration // an InsertMedia or EjectMedia task
+	busyTimeout     time.Duration // retrying a boot override the BMC refuses while the host boots
+	bmcResetTimeout time.Duration // the BMC answering again after a reset
+	localAddr       func(bmc string) (string, error)
+	setenv          func(key, value string) error
+	startPiped      func(argv []string) (consoleProcess, error)
+	probeSSH        func(port int) error
 }
 
 // Defaults for a BMC that reports no SerialConsole. Port 2200 is OpenBMC's
@@ -60,12 +69,18 @@ const (
 
 func newBMC(runner exec.Runner, cfg Config) Platform {
 	b := &bmcPlatform{
-		runner:       runner,
-		access:       cfg.BMC,
-		progress:     os.Stderr,
-		pollEvery:    2 * time.Second,
-		powerTimeout: 3 * time.Minute,
-		setenv:       os.Setenv,
+		runner:          runner,
+		access:          cfg.BMC,
+		progress:        os.Stderr,
+		out:             os.Stdout,
+		pollEvery:       2 * time.Second,
+		powerTimeout:    3 * time.Minute,
+		slotsTimeout:    60 * time.Second,
+		insertTimeout:   3 * time.Minute,
+		busyTimeout:     60 * time.Second,
+		bmcResetTimeout: 5 * time.Minute,
+		localAddr:       localAddrToward,
+		setenv:          os.Setenv,
 		startPiped: func(argv []string) (consoleProcess, error) {
 			return exec.StartPiped(argv)
 		},
@@ -112,17 +127,25 @@ func (b *bmcPlatform) configure() error {
 	return nil
 }
 
-// system reads the ComputerSystem the driver acts on.
-func (b *bmcPlatform) system() (redfish.System, error) {
+// resolveSystem finds the path of the ComputerSystem the driver acts on, once.
+func (b *bmcPlatform) resolveSystem() error {
 	if b.configErr != nil {
-		return redfish.System{}, b.configErr
+		return b.configErr
 	}
 	if b.systemPath == "" {
 		path, err := b.redfish.SystemPath(b.access.System)
 		if err != nil {
-			return redfish.System{}, err
+			return err
 		}
 		b.systemPath = path
+	}
+	return nil
+}
+
+// system reads the ComputerSystem the driver acts on.
+func (b *bmcPlatform) system() (redfish.System, error) {
+	if err := b.resolveSystem(); err != nil {
+		return redfish.System{}, err
 	}
 	return b.redfish.System(b.systemPath)
 }
@@ -149,6 +172,11 @@ func (b *bmcPlatform) PowerState() (PowerStatus, error) {
 }
 
 func (b *bmcPlatform) SetPower(target Power) error {
+	return b.setPower(context.Background(), target)
+}
+
+// setPower is SetPower that stops waiting for the host when ctx ends.
+func (b *bmcPlatform) setPower(ctx context.Context, target Power) error {
 	system, err := b.system()
 	if err != nil {
 		return err
@@ -163,7 +191,7 @@ func (b *bmcPlatform) SetPower(target Power) error {
 	if err := b.reset(system, resetType); err != nil {
 		return err
 	}
-	return b.pollPower(target)
+	return b.pollPower(ctx, target)
 }
 
 func (b *bmcPlatform) PowerReset() error {
@@ -177,7 +205,7 @@ func (b *bmcPlatform) PowerReset() error {
 	if err := b.reset(system, "ForceRestart", "PowerCycle"); err != nil {
 		return err
 	}
-	return b.pollPower(PowerOn)
+	return b.pollPower(context.Background(), PowerOn)
 }
 
 func (b *bmcPlatform) HardReset() error {
@@ -195,7 +223,7 @@ func (b *bmcPlatform) HardReset() error {
 	if err := b.reset(system, "ForceRestart"); err != nil {
 		return err
 	}
-	return b.pollPower(PowerOn)
+	return b.pollPower(context.Background(), PowerOn)
 }
 
 // pickReset returns the first of choices the BMC allows. A BMC that lists no
@@ -228,8 +256,8 @@ func (b *bmcPlatform) reset(system redfish.System, choices ...string) error {
 	return b.redfish.Reset(target, resetType)
 }
 
-// pollPower waits for the host to reach target.
-func (b *bmcPlatform) pollPower(target Power) error {
+// pollPower waits for the host to reach target, or until ctx ends.
+func (b *bmcPlatform) pollPower(ctx context.Context, target Power) error {
 	deadline := time.Now().Add(b.powerTimeout)
 	for {
 		status, err := b.PowerState()
@@ -243,7 +271,25 @@ func (b *bmcPlatform) pollPower(target Power) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("host still %s after %s, want %s", status, b.powerTimeout, target)
 		}
-		time.Sleep(b.pollEvery)
+		if err := pause(ctx, b.pollEvery); err != nil {
+			return err
+		}
+	}
+}
+
+// errInterrupted reports a wait that ended with its context.
+var errInterrupted = errors.New("interrupted before the host booted the image")
+
+// pause waits d, or returns errInterrupted once ctx has ended.
+func pause(ctx context.Context, d time.Duration) error {
+	if ctx.Err() != nil {
+		return errInterrupted
+	}
+	select {
+	case <-ctx.Done():
+		return errInterrupted
+	case <-time.After(d):
+		return nil
 	}
 }
 
@@ -519,7 +565,3 @@ func (b *bmcPlatform) FlashStatus(FlashTarget) (Status, error) {
 	return Status{}, ErrNotImplemented
 }
 func (b *bmcPlatform) FlashAbort(FlashTarget) error { return ErrNotImplemented }
-
-func (b *bmcPlatform) DiskMount(string, DiskMedium) error { return ErrNotImplemented }
-func (b *bmcPlatform) DiskEject() error                   { return ErrNotImplemented }
-func (b *bmcPlatform) DiskStatus() error                  { return ErrNotImplemented }
