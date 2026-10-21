@@ -41,20 +41,21 @@ type mediaBMC struct {
 	slots   []*fakeSlot
 
 	powerState   string
-	rmedia       string // AMI RMediaStatus, empty for none
-	emptyPolls   int    // collection reads that stay empty after remote media is on
-	untilReset   bool   // the collection stays empty until a manager reset
-	busy         int    // boot PATCHes answered 503 while the host boots
-	fetch        bool   // InsertMedia fetches the image as a BMC does
-	failInsert   bool   // the insert task ends in Exception
-	rejectInsert bool   // InsertMedia answers 400 before any fetch
-	misreport    bool   // a slot reports an inserted image under another path
-	failPowerOn  bool   // ComputerSystem.Reset to On fails
-	failEject    bool   // EjectMedia fails
-	busyWhileOn  bool   // boot PATCHes answered 503 whenever the host is on
-	onInsert     func() // called on every InsertMedia
-	onPowerOn    func() // called on every ComputerSystem.Reset to On
-	down         int    // service root reads that fail after a manager reset
+	rmedia       string   // AMI RMediaStatus, empty for none
+	emptyPolls   int      // collection reads that stay empty after remote media is on
+	untilReset   bool     // the collection stays empty until a manager reset
+	busy         int      // boot PATCHes answered 503 while the host boots
+	fetch        bool     // InsertMedia fetches the image as a BMC does
+	failInsert   bool     // the insert task ends in Exception
+	rejectInsert bool     // InsertMedia answers 400 before any fetch
+	protocols    []string // TransferProtocolType values the AMI ActionInfo lists, nil for none
+	misreport    bool     // a slot reports an inserted image under another path
+	failPowerOn  bool     // ComputerSystem.Reset to On fails
+	failEject    bool     // EjectMedia fails
+	busyWhileOn  bool     // boot PATCHes answered 503 whenever the host is on
+	onInsert     func()   // called on every InsertMedia
+	onPowerOn    func()   // called on every ComputerSystem.Reset to On
+	down         int      // service root reads that fail after a manager reset
 	etag         int
 	boot         map[string]any
 	resets       []string
@@ -309,7 +310,7 @@ func (bmc *mediaBMC) serveSlot(w http.ResponseWriter, r *http.Request, rest stri
 	case r.Method == http.MethodGet && action == "InsertMediaActionInfo":
 		_ = json.NewEncoder(w).Encode(map[string]any{"Parameters": []map[string]any{
 			{"Name": "Image", "Required": true},
-			{"Name": "TransferProtocolType", "Required": true},
+			{"Name": "TransferProtocolType", "Required": true, "AllowableValues": bmc.protocols},
 			{"Name": "UserName"}, {"Name": "Password"}, {"Name": "MediaType"},
 		}})
 	case r.Method == http.MethodPost && action == "Actions/VirtualMedia.InsertMedia":
@@ -899,6 +900,41 @@ func TestBMCDiskServeGivesNoFetchHintForARejectedInsert(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "got no request") {
 		t.Errorf("error = %q, want no fetch hint for an insert the BMC refused", err)
+	}
+}
+
+func TestBMCDiskMountRefusesAProtocolTheActionInfoLeavesOut(t *testing.T) {
+	bmc := amiMediaBMC()
+	bmc.protocols = []string{"NFS", "CIFS"}
+	driver, _, _ := newMediaTestBMC(t, bmc)
+
+	err := driver.DiskMount(context.Background(), "https://10.0.0.9/debian.iso", DiskOptions{})
+	if err == nil || !strings.Contains(err.Error(), "CD1 takes images over NFS, CIFS, not HTTPS") {
+		t.Fatalf("DiskMount = %v, want HTTPS refused by the ActionInfo", err)
+	}
+	if len(bmc.resets) != 0 || len(bmc.inserts) != 0 {
+		t.Errorf("resets = %q, inserts = %v, want the host left alone and no insert", bmc.resets, bmc.inserts)
+	}
+
+	bmc.protocols = []string{"NFS", "HTTPS"}
+	if err := driver.DiskMount(context.Background(), "https://10.0.0.9/debian.iso", DiskOptions{}); err != nil {
+		t.Errorf("DiskMount with HTTPS listed = %v", err)
+	}
+}
+
+func TestBMCDiskMountHintsAtNFSForAUSBInsertOverHTTPS(t *testing.T) {
+	bmc := amiMediaBMC()
+	bmc.failInsert = true
+	driver, _, _ := newMediaTestBMC(t, bmc)
+
+	err := driver.DiskMount(context.Background(), "https://10.0.0.9/disk.img", DiskOptions{Medium: DiskUSB})
+	if err == nil || !strings.Contains(err.Error(), "Some BMCs take USB images only over NFS or CIFS") {
+		t.Errorf("DiskMount on USB = %v, want the USB hint", err)
+	}
+
+	err = driver.DiskMount(context.Background(), "https://10.0.0.9/debian.iso", DiskOptions{Medium: DiskCD})
+	if err == nil || strings.Contains(err.Error(), "USB images") {
+		t.Errorf("DiskMount on CD = %v, want no USB hint", err)
 	}
 }
 

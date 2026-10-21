@@ -280,25 +280,27 @@ func mediaKindFor(imageURL string, medium DiskMedium) (mediaKind, error) {
 // pickSlot returns a slot of kind that takes InsertMedia, an empty one first.
 // A slot fits by its MediaTypes, or by its ID when it lists none.
 func pickSlot(slots []*schemas.VirtualMedia, kind mediaKind) (*schemas.VirtualMedia, error) {
-	var fits []*schemas.VirtualMedia
+	var fitting []*schemas.VirtualMedia
 	for _, slot := range slots {
-		if !slot.SupportsMediaInsert {
-			continue
-		}
-		if len(slot.MediaTypes) > 0 && slices.Contains(slot.MediaTypes, kind.mediaType) ||
-			len(slot.MediaTypes) == 0 && strings.HasPrefix(slot.ID, kind.idPrefix) {
-			fits = append(fits, slot)
+		if slot.SupportsMediaInsert && fits(slot, kind) {
+			fitting = append(fitting, slot)
 		}
 	}
-	for _, slot := range fits {
+	for _, slot := range fitting {
 		if !inserted(slot) {
 			return slot, nil
 		}
 	}
-	if len(fits) > 0 {
-		return fits[0], nil
+	if len(fitting) > 0 {
+		return fitting[0], nil
 	}
 	return nil, fmt.Errorf("the BMC offers no %s slot that takes InsertMedia (it offers %s)", kind.mediaType, describeSlots(slots))
+}
+
+// fits reports whether slot is of kind.
+func fits(slot *schemas.VirtualMedia, kind mediaKind) bool {
+	return len(slot.MediaTypes) > 0 && slices.Contains(slot.MediaTypes, kind.mediaType) ||
+		len(slot.MediaTypes) == 0 && strings.HasPrefix(slot.ID, kind.idPrefix)
 }
 
 // describeSlots lists slots with their media types, for an error.
@@ -461,6 +463,9 @@ func (b *bmcPlatform) mount(ctx context.Context, imageURL string, opts DiskOptio
 		return "", fmt.Errorf("%w after %s: a BMC reset brought the slots back once on one board, and --reset-bmc does it", err, b.slotsTimeout)
 	}
 	if err == nil {
+		err = checkProtocol(slots, kind, protocol)
+	}
+	if err == nil {
 		err = interrupted()
 	}
 	if err != nil {
@@ -483,6 +488,9 @@ func (b *bmcPlatform) mount(ctx context.Context, imageURL string, opts DiskOptio
 		return "", err
 	}
 	if err := b.insert(slot, imageURL, protocol, kind); err != nil {
+		if kind == kindUSB && protocol == schemas.HTTPSTransferProtocolType {
+			err = fmt.Errorf("%w\n%s", err, usbHTTPSHint)
+		}
 		var rejected *schemas.Error // the BMC refused the POST, before any fetch
 		switch {
 		case errors.As(err, &rejected):
@@ -532,6 +540,49 @@ func (b *bmcPlatform) undoMount(err error) error {
 		return fmt.Errorf("%w (undoing the mount also failed: %v)", err, undoErr)
 	}
 	return err
+}
+
+// usbHTTPSHint follows a failed insert of an https:// URL into a USB slot. An
+// AMI BMC listed HTTPS in the USB slots' ActionInfo, refused an ISO there, and
+// failed an .img without fetching it.
+const usbHTTPSHint = "Some BMCs take USB images only over NFS or CIFS, even when they list HTTPS for the slot.\n" +
+	"An ISO can go into a CD slot with --medium cd. A raw image can go over NFS: export it and mount its nfs:// URL."
+
+// checkProtocol refuses protocol when every slot of kind has an InsertMedia
+// ActionInfo whose TransferProtocolType values leave it out. A slot without an
+// ActionInfo, or one that lists no values, may take protocol.
+func checkProtocol(slots []*schemas.VirtualMedia, kind mediaKind, protocol schemas.TransferProtocolType) error {
+	slot, err := pickSlot(slots, kind)
+	if err != nil {
+		return err
+	}
+	var allowed []string
+	for _, other := range slots {
+		if other.SupportsMediaInsert && fits(other, kind) {
+			values, listed := protocolsAllowed(other)
+			if !listed || slices.Contains(values, string(protocol)) {
+				return nil
+			}
+			allowed = values
+		}
+	}
+	return fmt.Errorf("%s takes images over %s, not %s, by its InsertMedia ActionInfo: serve the image over one of those or pick another medium with --medium",
+		slot.ID, strings.Join(allowed, ", "), protocol)
+}
+
+// protocolsAllowed returns the TransferProtocolType values slot's InsertMedia
+// ActionInfo lists, and whether it lists any.
+func protocolsAllowed(slot *schemas.VirtualMedia) ([]string, bool) {
+	info, err := slot.InsertMediaActionInfo()
+	if err != nil {
+		return nil, false
+	}
+	for _, p := range info.Parameters {
+		if p.Name == "TransferProtocolType" && len(p.AllowableValues) > 0 {
+			return p.AllowableValues, true
+		}
+	}
+	return nil, false
 }
 
 // fetchHint explains the ways past a BMC that took InsertMedia for imageURL and

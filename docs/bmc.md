@@ -107,6 +107,8 @@ stick and sets a boot override to it:
 1. Remote media is switched on where an AMI BMC reports it off, through the
    manager's `EnableRMedia` action, and the driver waits up to a minute for
    slots that take `InsertMedia`.
+1. A URL whose protocol the slots' `InsertMedia` `ActionInfo` leaves out is
+   refused here, before the host is touched.
 1. The host is powered off (`ForceOff`).
 1. Every inserted slot with an `EjectMedia` action is ejected.
 1. The image goes into a free CD slot for an `.iso` and a USB stick slot for any
@@ -170,6 +172,13 @@ lists these ways through. For a URL benchctl does not serve, AMI's
 `InsertMediaError` brings up a shorter hint that names the port. A BMC that
 refuses the `InsertMedia` request itself gets no hint, since it fetched nothing.
 The AMI bench refuses an `.iso` URL on a USB stick slot that way.
+
+The AMI bench lists HTTPS in its USB stick slots' `ActionInfo`, but it refuses
+an `.iso` there and fails an `.img` without fetching it. It takes USB images
+only over the share types its web interface offers for hard disk images. Any
+failed insert of an `https://` URL into a USB stick slot therefore adds a hint:
+an ISO can go into a CD slot with `--medium cd`, and a raw image can be exported
+over NFS and mounted by its `nfs://` URL.
 
 ### BMC rules
 
