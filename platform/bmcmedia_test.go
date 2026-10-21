@@ -22,6 +22,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 // mediaBMC is a Redfish service with virtual media in one of two flavours. With
@@ -30,8 +32,10 @@ import (
 // BootSourceOverrideMode required, media moved to the first free slot and
 // reported as "//host/path", images fetched as "//path", and tasks for the
 // media actions.
-// Without it, it answers as an OpenBMC build with remote media does: a proxy
-// slot without actions, USB slots that list both media types, and 204 answers.
+// Without it, it answers as an OpenBMC build with remote media and the NBD
+// proxy does: USB slots that list both media types, 204 answers, and Slot_0
+// left out of the collection, with EjectMedia only, served over an NBD
+// websocket at /nbd/0.
 type mediaBMC struct {
 	mu sync.Mutex
 
@@ -48,6 +52,7 @@ type mediaBMC struct {
 	fetch        bool     // InsertMedia fetches the image as a BMC does
 	failInsert   bool     // the insert task ends in Exception
 	rejectInsert bool     // InsertMedia answers 400 before any fetch
+	failMount    bool     // InsertMedia answers 500, as when the virtual media service refuses bmcweb's Mount call
 	protocols    []string // TransferProtocolType values the AMI ActionInfo lists, nil for none
 	misreport    bool     // a slot reports an inserted image under another path
 	failPowerOn  bool     // ComputerSystem.Reset to On fails
@@ -67,6 +72,9 @@ type mediaBMC struct {
 	tasks        map[string]map[string]any
 	fetched      []string // requests made to the image server, as "METHOD range"
 	httpsClient  *http.Client
+	dropStream   bool          // the NBD websocket closes with a reason after the handshake
+	streamed     []byte        // what the NBD client read from the websocket
+	unmount      chan struct{} // closed by EjectMedia on a streamed slot
 }
 
 // fakeSlot is one virtual media slot.
@@ -76,6 +84,7 @@ type fakeSlot struct {
 	insert, eject bool
 	inserted      bool
 	image         string
+	hidden        bool // left out of the collection
 }
 
 func amiMediaBMC() *mediaBMC {
@@ -103,7 +112,7 @@ func openBMCMediaBMC() *mediaBMC {
 		powerState: "On",
 		boot:       map[string]any{"BootSourceOverrideEnabled": "Disabled", "BootSourceOverrideTarget": "None", "BootSourceOverrideMode": "UEFI"},
 		slots: []*fakeSlot{
-			{id: "Slot_0", types: both, inserted: true, image: "proxy"},
+			{id: "Slot_0", types: both, eject: true, hidden: true},
 			{id: "USB1", types: both, insert: true, eject: true},
 			{id: "USB2", types: both, insert: true, eject: true},
 		},
@@ -129,6 +138,10 @@ func redfishFail(w http.ResponseWriter, status int, id string) {
 }
 
 func (bmc *mediaBMC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/nbd/") {
+		bmc.serveNBD(w, r)
+		return
+	}
 	bmc.mu.Lock()
 	defer bmc.mu.Unlock()
 	// gofish reads the service root as "/redfish/v1/", before it
@@ -257,7 +270,9 @@ func (bmc *mediaBMC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			bmc.emptyPolls--
 		default:
 			for _, slot := range bmc.slots {
-				members = append(members, map[string]string{"@odata.id": bmc.mediaPath() + "/" + slot.id})
+				if !slot.hidden {
+					members = append(members, map[string]string{"@odata.id": bmc.mediaPath() + "/" + slot.id})
+				}
 			}
 		}
 		reply(map[string]any{"Members": members, "Members@odata.count": len(members)})
@@ -320,6 +335,10 @@ func (bmc *mediaBMC) serveSlot(w http.ResponseWriter, r *http.Request, rest stri
 			redfishFail(w, http.StatusBadRequest, "Base.1.12.ActionParameterValueFormatError")
 			return
 		}
+		if bmc.failMount {
+			redfishFail(w, http.StatusInternalServerError, "Base.1.19.InternalError")
+			return
+		}
 		if bmc.onInsert != nil {
 			bmc.onInsert()
 		}
@@ -378,6 +397,10 @@ func (bmc *mediaBMC) serveSlot(w http.ResponseWriter, r *http.Request, rest stri
 		slot.inserted = false
 		slot.image = ""
 		bmc.etag++
+		if bmc.unmount != nil {
+			close(bmc.unmount)
+			bmc.unmount = nil
+		}
 		if bmc.ami {
 			bmc.startTask(w, map[string]any{"TaskState": "Completed"})
 			return
@@ -391,6 +414,63 @@ func (bmc *mediaBMC) serveSlot(w http.ResponseWriter, r *http.Request, rest stri
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// serveNBD is the NBD websocket at /nbd/0 for Slot_0. It reads the whole image
+// as the BMC's NBD client, reports Slot_0 inserted and keeps the connection
+// until benchctl closes it or EjectMedia unmounts the slot, which sends
+// NBD_CMD_DISC.
+func (bmc *mediaBMC) serveNBD(w http.ResponseWriter, r *http.Request) {
+	if user, password, ok := r.BasicAuth(); !ok || user != "root" || password != "0penBmc" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	bmc.mu.Lock()
+	slot := bmc.slot("Slot_0")
+	drop := bmc.dropStream
+	bmc.mu.Unlock()
+	if slot == nil || r.URL.Path != "/nbd/0" {
+		http.NotFound(w, r)
+		return
+	}
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	// bmcweb's buffer for one message.
+	conn.SetReadLimit(131088)
+	client := newNBDTestClient(&wsStream{conn: conn})
+	size, _, err := client.handshake()
+	if err != nil || drop {
+		conn.Close(websocket.StatusNormalClosure, "Internal Error")
+		return
+	}
+	data, err := client.readAll(size, 256<<10)
+	if err != nil {
+		conn.Close(websocket.StatusInternalError, err.Error())
+		return
+	}
+	unmount := make(chan struct{})
+	bmc.mu.Lock()
+	bmc.streamed = data
+	slot.inserted = true
+	bmc.unmount = unmount
+	bmc.mu.Unlock()
+	closed := make(chan struct{})
+	go func() {
+		_, _, _ = conn.Read(context.Background())
+		close(closed)
+	}()
+	select {
+	case <-unmount:
+		_, _, _ = client.request(nbdCmdDisc, 0, 0, nil)
+		conn.Close(websocket.StatusNormalClosure, "")
+	case <-closed:
+	}
+	bmc.mu.Lock()
+	slot.inserted = false
+	bmc.unmount = nil
+	bmc.mu.Unlock()
 }
 
 // startTask answers 202 with a new task that reads as final.
@@ -504,7 +584,7 @@ func TestBMCDiskMountOnAMIEnablesRemoteMediaAndBootsTheCD(t *testing.T) {
 	}
 }
 
-func TestBMCDiskMountOnOpenBMCUsesAUSBSlotAndLeavesTheProxySlotAlone(t *testing.T) {
+func TestBMCDiskMountOfAURLOnOpenBMCUsesAUSBSlot(t *testing.T) {
 	bmc := openBMCMediaBMC()
 	driver, progress, _ := newMediaTestBMC(t, bmc)
 
@@ -515,7 +595,7 @@ func TestBMCDiskMountOnOpenBMCUsesAUSBSlotAndLeavesTheProxySlotAlone(t *testing.
 		t.Errorf("resets = %q, power %s, want %q and On with PowerOn", bmc.resets, bmc.powerState, want)
 	}
 	if len(bmc.ejects) != 0 {
-		t.Errorf("ejects = %q, want none: Slot_0 has no EjectMedia", bmc.ejects)
+		t.Errorf("ejects = %q, want none: no slot holds media", bmc.ejects)
 	}
 	if len(bmc.inserts) != 1 || bmc.inserts[0]["slot"] != "USB1" {
 		t.Fatalf("inserts = %v, want one into USB1", bmc.inserts)
@@ -528,6 +608,21 @@ func TestBMCDiskMountOnOpenBMCUsesAUSBSlotAndLeavesTheProxySlotAlone(t *testing.
 	}
 	if got := bmc.boot["BootSourceOverrideEnabled"]; got != "Once" {
 		t.Errorf("boot override = %v, want Once", got)
+	}
+}
+
+func TestBMCDiskServeSuggestsTheWebsocketWhenTheBMCFailsTheInsert(t *testing.T) {
+	bmc := openBMCMediaBMC()
+	bmc.failMount = true
+	driver, progress, _ := newMediaTestBMC(t, bmc)
+	image, _ := streamTestImage(t, "disk.img")
+
+	err := driver.DiskServe(context.Background(), image, DiskServeOptions{Listen: "127.0.0.1:0"})
+	if err == nil || !strings.Contains(err.Error(), "--transport websocket") || !strings.Contains(err.Error(), "Slot_0") {
+		t.Fatalf("DiskServe = %v, want the websocket suggested\n%s", err, progress)
+	}
+	if strings.Contains(err.Error(), "NFS") {
+		t.Errorf("DiskServe = %v, want no NFS hint on a BMC with the websocket", err)
 	}
 }
 
@@ -617,24 +712,27 @@ func TestBMCDiskEjectEjectsInsertedSlotsAndClearsTheOverride(t *testing.T) {
 	bmc := openBMCMediaBMC()
 	bmc.slots[2].inserted = true
 	bmc.slots[2].image = "https://10.0.0.9/disk.img"
+	bmc.slot("Slot_0").inserted = true
+	// A slot another session fills, without EjectMedia.
+	bmc.slots = append(bmc.slots, &fakeSlot{id: "USB3", types: []string{"USBStick"}, inserted: true, image: "console"})
 	bmc.boot = map[string]any{"BootSourceOverrideEnabled": "Continuous", "BootSourceOverrideTarget": "Usb", "BootSourceOverrideMode": "UEFI"}
 	driver, _, _ := newMediaTestBMC(t, bmc)
 
 	if err := driver.DiskEject(""); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"USB2"}; !slices.Equal(bmc.ejects, want) {
-		t.Errorf("ejects = %q, want %q", bmc.ejects, want)
+	if want := []string{"USB2", "Slot_0"}; !slices.Equal(bmc.ejects, want) {
+		t.Errorf("ejects = %q, want %q: Slot_0 is out of the collection and still ejected", bmc.ejects, want)
 	}
-	if !bmc.slot("Slot_0").inserted {
-		t.Error("Slot_0 ejected, want the proxy slot left alone")
+	if !bmc.slot("USB3").inserted {
+		t.Error("USB3 ejected, want a slot without EjectMedia left alone")
 	}
 	if got := bmc.boot["BootSourceOverrideEnabled"]; got != "Disabled" {
 		t.Errorf("boot override = %v, want Disabled", got)
 	}
 
-	if err := driver.DiskEject("Slot_0"); err == nil || !strings.Contains(err.Error(), "no EjectMedia") {
-		t.Errorf("DiskEject(Slot_0) = %v, want a refusal", err)
+	if err := driver.DiskEject("USB3"); err == nil || !strings.Contains(err.Error(), "no EjectMedia") {
+		t.Errorf("DiskEject(USB3) = %v, want a refusal", err)
 	}
 	if err := driver.DiskEject("CD9"); err == nil || !strings.Contains(err.Error(), "no virtual media slot") {
 		t.Errorf("DiskEject(CD9) = %v, want an unknown slot", err)

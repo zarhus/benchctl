@@ -209,6 +209,7 @@ func TestDiskEject(t *testing.T) {
 func TestDiskMountServesALocalFileOnADiskServer(t *testing.T) {
 	t.Setenv("BENCHCTL_MEDIA_LISTEN", "")
 	t.Setenv("BENCHCTL_MEDIA_URL", "https://10.0.0.9/")
+	t.Setenv("BENCHCTL_MEDIA_TRANSPORT", "https")
 	fake := &fakeDiskServer{}
 	withFakePlatform(t, fake)
 	if _, err := run(t, "disk", "mount", "debian.iso", "--boot-once", "--power-on"); err != nil {
@@ -219,11 +220,22 @@ func TestDiskMountServesALocalFileOnADiskServer(t *testing.T) {
 	}
 	want := platform.DiskServeOptions{
 		DiskOptions: platform.DiskOptions{BootOnce: true, PowerOn: true},
+		Transport:   platform.TransportHTTPS,
 		Listen:      ":8443",
 		MediaURL:    "https://10.0.0.9/",
 	}
 	if fake.opts != want {
 		t.Errorf("DiskServe options = %+v, want %+v", fake.opts, want)
+	}
+
+	if _, err := run(t, "disk", "mount", "debian.iso", "--transport", "websocket"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.opts.Transport != platform.TransportWebsocket {
+		t.Errorf("--transport websocket: Transport = %q, want the flag over the variable", fake.opts.Transport)
+	}
+	if _, err := run(t, "disk", "mount", "debian.iso", "--transport", "nbd"); err == nil || !strings.Contains(err.Error(), "unknown media transport") {
+		t.Errorf("--transport nbd: err = %v, want an unknown transport", err)
 	}
 }
 

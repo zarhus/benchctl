@@ -20,6 +20,7 @@ func diskCmd() *cobra.Command {
 
 	var (
 		mountMedium        string
+		transport          string
 		listen, mediaURL   string
 		bootOnce, resetBMC bool
 		powerOn            bool
@@ -36,10 +37,16 @@ On the bmc platform, the BMC presents the image to the host as virtual media and
 a boot override boots it. disk mount powers the host off, attaches the image,
 sets the boot override and prints "disk-ready". The host stays off for the
 caller to attach the console and run power on, or disk mount powers it on
-before "disk-ready" with --power-on. A local file is served over HTTPS for the
-BMC to fetch: disk mount serves it until SIGINT or SIGTERM, then ejects it. An
-https:// or nfs:// URL goes to the BMC as it is, and disk mount returns after
-"disk-ready".
+before "disk-ready" with --power-on. disk mount serves a local file until
+SIGINT or SIGTERM, then ejects it. An https:// or nfs:// URL goes to the BMC as
+it is, and disk mount returns after "disk-ready".
+
+--transport (or BENCHCTL_MEDIA_TRANSPORT) sets how a local file reaches the BMC:
+https, the default, serves it over HTTPS for the BMC to fetch, websocket streams
+it over the BMC's NBD websocket, and auto picks websocket where the BMC offers
+it and https otherwise. Some OpenBMC virtual media services crash when Redfish
+reads the slot during a websocket stream, so websocket suits a BMC known to
+have the fix. --listen and --media-url apply to https only.
 
 A signal before "disk-ready" stops the mount at once while it waits, or after
 the insert or eject task it is following. A mount that stops or fails after
@@ -54,6 +61,10 @@ from port 443: listen on :443, or redirect 443 to the listen port and set
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			medium, err := platform.ParseDiskMedium(mountMedium)
+			if err != nil {
+				return err
+			}
+			mediaTransport, err := platform.ParseMediaTransport(resolveSetting(transport, "BENCHCTL_MEDIA_TRANSPORT"))
 			if err != nil {
 				return err
 			}
@@ -73,6 +84,7 @@ from port 443: listen on :443, or redirect 443 to the listen port and set
 				}
 				return server.DiskServe(ctx, image, platform.DiskServeOptions{
 					DiskOptions: opts,
+					Transport:   mediaTransport,
 					Listen:      resolveSettingOr(listen, "BENCHCTL_MEDIA_LISTEN", ":8443"),
 					MediaURL:    resolveSetting(mediaURL, "BENCHCTL_MEDIA_URL"),
 				})
@@ -81,6 +93,7 @@ from port 443: listen on :443, or redirect 443 to the listen port and set
 	}
 	flags := mount.Flags()
 	flags.StringVar(&mountMedium, "medium", "", "how the image is presented to the host: virtio or ahci on fvp (default virtio, ahci is known to crash the reference UEFI on rdv3, see kb/rdv3.md), cd or usb on bmc (default cd for .iso, usb otherwise)")
+	flags.StringVar(&transport, "transport", "", "how a local file reaches the BMC: auto, https or websocket (or BENCHCTL_MEDIA_TRANSPORT; default https)")
 	flags.StringVar(&listen, "listen", "", "`address` the image server listens on (or BENCHCTL_MEDIA_LISTEN; default :8443)")
 	flags.StringVar(&mediaURL, "media-url", "", "`URL` the BMC fetches the image under, without the file name (or BENCHCTL_MEDIA_URL)")
 	flags.BoolVar(&bootOnce, "boot-once", false, "boot the image once instead of until disk eject")
@@ -94,7 +107,8 @@ from port 443: listen on :443, or redirect 443 to the listen port and set
 		Long: `Detach the disk image.
 
 On the bmc platform, disk eject ejects every inserted virtual media slot that
-has an EjectMedia action, or only --slot, and clears the boot override.`,
+has an EjectMedia action, or only --slot, and clears the boot override. That
+includes the slot of a mount over the NBD websocket, which then ends.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withPlatform(func(p platform.Platform) error {

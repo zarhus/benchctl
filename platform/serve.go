@@ -54,8 +54,31 @@ type DiskServer interface {
 // DiskServeOptions is how DiskServe attaches and serves a local image.
 type DiskServeOptions struct {
 	DiskOptions
-	Listen   string // address the image server listens on, as ":8443"
-	MediaURL string // URL the BMC fetches the image under, without the file name; empty derives it
+	Transport MediaTransport // how the image travels to the BMC
+	Listen    string         // address the image server listens on, as ":8443"
+	MediaURL  string         // URL the BMC fetches the image under, without the file name; empty derives it
+}
+
+// MediaTransport is how DiskServe gets a local image to the BMC.
+type MediaTransport string
+
+const (
+	TransportAuto      MediaTransport = "auto"      // the driver picks by what the BMC offers
+	TransportHTTPS     MediaTransport = "https"     // the BMC fetches the image from benchctl's HTTPS server
+	TransportWebsocket MediaTransport = "websocket" // benchctl streams the image over the BMC's NBD websocket
+)
+
+// ParseMediaTransport maps a CLI-facing name to a MediaTransport. Empty is
+// TransportHTTPS.
+func ParseMediaTransport(name string) (MediaTransport, error) {
+	switch transport := MediaTransport(name); transport {
+	case "":
+		return TransportHTTPS, nil
+	case TransportAuto, TransportHTTPS, TransportWebsocket:
+		return transport, nil
+	default:
+		return "", fmt.Errorf("unknown media transport %q (want auto, https or websocket)", name)
+	}
 }
 
 // DiskReady is the line the bmc driver's DiskMount and DiskServe print once the

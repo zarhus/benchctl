@@ -357,12 +357,20 @@ func (b *bmcPlatform) DiskMount(ctx context.Context, image string, opts DiskOpti
 	return err
 }
 
-// DiskServe serves a local image over HTTPS, attaches it, boots the host from
-// it and serves until ctx ends. It then ejects the image and clears the boot
-// override.
+// DiskServe serves a local image, attaches it, boots the host from it and
+// serves until ctx ends. It then ejects the image and clears the boot override.
+// The image goes over the BMC's NBD websocket where opts.Transport asks for it
+// and the BMC offers one, and otherwise over HTTPS for the BMC to fetch.
 func (b *bmcPlatform) DiskServe(ctx context.Context, image string, opts DiskServeOptions) error {
 	if b.configErr != nil {
 		return b.configErr
+	}
+	stream, err := b.routeSlot(opts.Transport)
+	if err != nil {
+		return err
+	}
+	if stream != nil {
+		return b.streamMount(ctx, image, opts.DiskOptions, stream)
 	}
 	listener, err := net.Listen("tcp", opts.Listen)
 	if err != nil {
@@ -488,7 +496,9 @@ func (b *bmcPlatform) mount(ctx context.Context, imageURL string, opts DiskOptio
 		return "", err
 	}
 	if err := b.insert(slot, imageURL, protocol, kind); err != nil {
-		if kind == kindUSB && protocol == schemas.HTTPSTransferProtocolType {
+		if stream, _, _ := b.streamSlot(); stream != nil {
+			err = fmt.Errorf("%w\n%s", err, fmt.Sprintf(streamHint, stream.ID))
+		} else if kind == kindUSB && protocol == schemas.HTTPSTransferProtocolType {
 			err = fmt.Errorf("%w\n%s", err, usbHTTPSHint)
 		}
 		var rejected *schemas.Error // the BMC refused the POST, before any fetch
@@ -547,6 +557,12 @@ func (b *bmcPlatform) undoMount(err error) error {
 // failed an .img without fetching it.
 const usbHTTPSHint = "Some BMCs take USB images only over NFS or CIFS, even when they list HTTPS for the slot.\n" +
 	"An ISO can go into a CD slot with --medium cd. A raw image can go over NFS: export it and mount its nfs:// URL."
+
+// streamHint follows a failed insert on a BMC that offers the websocket route.
+// An OpenBMC bmcweb called the virtual media service's Mount with an argument
+// type the service did not take, which failed every insert with 500.
+const streamHint = "This BMC also takes a local file over its NBD websocket in %s: --transport websocket.\n" +
+	"Some OpenBMC virtual media services crash when Redfish reads that slot during the stream, see \"NBD websocket\" in docs/bmc.md."
 
 // checkProtocol refuses protocol when every slot of kind has an InsertMedia
 // ActionInfo whose TransferProtocolType values leave it out. A slot without an
@@ -867,9 +883,10 @@ func (b *bmcPlatform) patchBoot(ctx context.Context, what string, fields func(sc
 }
 
 // DiskEject ejects every inserted slot that has an EjectMedia action, or only
-// the one with ID only, and clears the boot override.
+// the one with ID only, and clears the boot override. The slots include the
+// stream slot, whose eject ends a running websocket mount.
 func (b *bmcPlatform) DiskEject(only string) error {
-	slots, err := b.listSlots()
+	slots, err := b.allSlots()
 	if err != nil {
 		return err
 	}
@@ -887,14 +904,17 @@ func (b *bmcPlatform) DiskEject(only string) error {
 }
 
 // ejectSlots posts EjectMedia to every inserted slot among slots that has the
-// action. Slots without it, such as an OpenBMC proxy slot or one the BMC's web
-// console fills, belong to someone else's session.
+// action. Slots without it belong to someone else's session.
 func (b *bmcPlatform) ejectSlots(slots []*schemas.VirtualMedia) error {
 	for _, slot := range slots {
 		if !inserted(slot) || !slot.SupportsMediaEject {
 			continue
 		}
-		fmt.Fprintf(b.progress, "Ejecting %s from %s...\n", slot.Image, slot.ID)
+		if slot.Image == "" {
+			fmt.Fprintf(b.progress, "Ejecting %s...\n", slot.ID)
+		} else {
+			fmt.Fprintf(b.progress, "Ejecting %s from %s...\n", slot.Image, slot.ID)
+		}
 		task, err := slot.EjectMedia()
 		if err != nil {
 			return fmt.Errorf("EjectMedia on %s: %w", slot.ID, redfishError(err))
@@ -906,10 +926,10 @@ func (b *bmcPlatform) ejectSlots(slots []*schemas.VirtualMedia) error {
 	return nil
 }
 
-// DiskStatus prints the slots, the boot override and, on AMI, the remote media
-// status.
+// DiskStatus prints the slots, the stream slot included, the boot override and,
+// on AMI, the remote media status.
 func (b *bmcPlatform) DiskStatus() error {
-	slots, err := b.listSlots()
+	slots, err := b.allSlots()
 	if err != nil {
 		return err
 	}

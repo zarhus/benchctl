@@ -102,8 +102,9 @@ framework, as the [consoles] page describes.
 `disk mount` has the BMC present an image to the host as a read-only CD or USB
 stick and sets a boot override to it:
 
-1. A local file is served over HTTPS from this machine, see "Image server". An
-   `https://` or `nfs://` URL goes to the BMC as it is.
+1. A local file is served over HTTPS from this machine, see "Image server", or
+   streamed over the BMC's NBD websocket with `--transport`, see "NBD
+   websocket". An `https://` or `nfs://` URL goes to the BMC as it is.
 1. Remote media is switched on where an AMI BMC reports it off, through the
    manager's `EnableRMedia` action, and the driver waits up to a minute for
    slots that take `InsertMedia`.
@@ -132,19 +133,20 @@ then ejects the slots and clears the boot override as `disk eject` does.
 
 `disk eject` ejects every inserted slot with an `EjectMedia` action, or only
 `--slot`, and sets the boot override to `Disabled`. Slots without the action,
-such as an OpenBMC proxy slot or one the BMC's web console fills, belong to
-another session and stay as they are. `disk status` lists the slots, the boot
-override and, on AMI, the remote media status.
+such as one the BMC's web console fills, belong to another session and stay as
+they are. `disk status` lists the slots, the boot override and, on AMI, the
+remote media status.
 
-| Setting        | Flag          | Environment             | Default                                    |
-| -------------- | ------------- | ----------------------- | ------------------------------------------ |
-| Media type     | `--medium`    | none                    | `cd` for `.iso`, `usb` otherwise           |
-| Server address | `--listen`    | `BENCHCTL_MEDIA_LISTEN` | `:8443`                                    |
-| Image URL base | `--media-url` | `BENCHCTL_MEDIA_URL`    | `https://<address toward the BMC>:<port>/` |
-| One boot only  | `--boot-once` | none                    | off, the override stays until eject        |
-| Reset the BMC  | `--reset-bmc` | none                    | off                                        |
-| Power on       | `--power-on`  | none                    | off, the host stays off                    |
-| Slot to eject  | `--slot`      | none                    | every inserted slot                        |
+| Setting        | Flag          | Environment                | Default                                    |
+| -------------- | ------------- | -------------------------- | ------------------------------------------ |
+| Media type     | `--medium`    | none                       | `cd` for `.iso`, `usb` otherwise           |
+| Local file     | `--transport` | `BENCHCTL_MEDIA_TRANSPORT` | `https`                                    |
+| Server address | `--listen`    | `BENCHCTL_MEDIA_LISTEN`    | `:8443`                                    |
+| Image URL base | `--media-url` | `BENCHCTL_MEDIA_URL`       | `https://<address toward the BMC>:<port>/` |
+| One boot only  | `--boot-once` | none                       | off, the override stays until eject        |
+| Reset the BMC  | `--reset-bmc` | none                       | off                                        |
+| Power on       | `--power-on`  | none                       | off, the host stays off                    |
+| Slot to eject  | `--slot`      | none                       | every inserted slot                        |
 
 ```sh
 bin/benchctl disk mount debian-13.7.0-amd64-netinst.iso   # serves until Ctrl+C
@@ -152,6 +154,40 @@ bin/benchctl disk mount https://images.example/disk.img --boot-once --power-on
 bin/benchctl disk status
 bin/benchctl disk eject
 ```
+
+### NBD websocket
+
+An OpenBMC BMC built with bmcweb's NBD proxy offers a `Slot_0` that answers a
+`GET` by name, has `EjectMedia` and no `InsertMedia`, and links to the websocket
+`/nbd/0`. `--transport websocket` streams a local file there and fails on a BMC
+without that slot. `--transport auto` streams where the BMC offers the slot and
+serves over HTTPS otherwise. `https`, the default, always serves the file as
+"Image server" describes. `--listen` and `--media-url` apply to HTTPS only.
+
+benchctl opens the websocket with the BMC's credentials, over the same
+connection settings as Redfish, and acts as a read-only NBD server for the BMC's
+NBD client. The mount follows the steps above with the stream in place of the
+insert: the driver waits for `Slot_0` to report the image inserted, sets the
+boot override and prints `disk-ready`. It logs the handshake, the first read and
+then the read count and bytes served every 30 seconds.
+
+SIGINT or SIGTERM closes the websocket, waits for the slot to empty and clears
+the boot override. `disk eject` from another shell ejects `Slot_0`, the BMC's
+client disconnects, and the mount clears the override and exits 0. Any other end
+of the stream fails with the reason the BMC gave when it closed the websocket.
+
+Some OpenBMC virtual media services crash when Redfish reads any virtual media
+resource while the stream is up, and the crash holds the BMC's NBD device until
+the BMC reboots. bmcweb reads every slot's properties for each virtual media
+request, so `disk status`, `disk eject`, the mount's own wait and the BMC's web
+interface all trigger it. A failed insert stays recoverable without a reboot, so
+`https` is the default. When the stream ends before the slot reports the image
+inserted, the error says to check the service's journal.
+
+A failed `InsertMedia` on a BMC that offers `Slot_0` suggests
+`--transport websocket`. On one OpenBMC build, bmcweb called the virtual media
+service's `Mount` with an argument type the service did not take, and every
+insert failed with 500 whatever the protocol.
 
 ### Image server
 
