@@ -10,6 +10,25 @@ SPDX-License-Identifier: Apache-2.0
 Each bench type is a platform driver behind one command interface, and a new
 bench slots in as one more driver. It runs on Linux.
 
+## Installation
+
+```sh
+task install   # build the current revision and install it into GOPATH/bin
+
+# or the latest release, which pulls in any packages it needs
+latest() {
+  curl -sL https://api.github.com/repos/zarhus/benchctl/releases/latest |
+    grep -o "https://[^\"]*\.$1" | head -1
+}
+sudo dnf install "$(latest rpm)"                               # Fedora
+curl -LO "$(latest deb)" && sudo apt install ./benchctl_*.deb  # Debian, Ubuntu
+```
+
+The [releases] page also has a tar.gz archive with the binary, and a `.sha256`
+file for every download. `task build` writes `bin/benchctl` without installing
+it. benchctl is pure Go, so `GOARCH` builds it for a Linux bench of another
+architecture with no C toolchain.
+
 ## Quick start
 
 ```sh
@@ -18,11 +37,8 @@ bin/benchctl --host rte.local power status   # a BenchRack, from your PC
 bin/benchctl --host rte.local console        # its host console, Ctrl+] detaches
 ```
 
-`task build` and `go build -o bin/benchctl .` write the binary to `bin/benchctl`
-without installing it. The examples call it as `bin/benchctl`. Copy it onto your
-`PATH`, or run `task install` (`go install .`), to run it as `benchctl`.
-benchctl is pure Go, so `GOARCH` builds it for a Linux bench of another
-architecture with no C toolchain.
+The examples call a source build as `bin/benchctl`. An installed binary runs as
+`benchctl`.
 
 ## Platforms
 
@@ -144,3 +160,4 @@ which command needs which program.
 [consoles]: docs/consoles.md
 [development]: docs/development.md
 [fvp]: docs/fvp.md
+[releases]: https://github.com/zarhus/benchctl/releases
