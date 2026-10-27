@@ -29,6 +29,7 @@ locally, so there is no SSH user and no board wiring. `--host localhost`, or
 | Console port |           | `BENCHCTL_FVP_CONSOLE_PORT` | `6000`         |
 | Iris port    |           | `BENCHCTL_FVP_IRIS_PORT`    | `7300`         |
 | Work dir     |           | `BENCHCTL_FVP_WORKDIR`      | `.fvp`         |
+| Extra data   |           | `BENCHCTL_FVP_DATA`         | none           |
 | Board        | `--board` | `BENCHCTL_BOARD`            | `rdv3`         |
 
 `BENCHCTL_FVP_MODEL` is the path to the `FVP_RD_V3` binary, and every command
@@ -43,6 +44,17 @@ others left free. Port 6000 sits clear of the cluster, so the request succeeds
 and `console` needs no port announcement from the model. The Iris port is where
 the model's Iris debug and control server listens. Port 7300 sits clear of the
 same cluster and of 7100 to 7109, the range Arm's Python Iris client scans.
+
+`BENCHCTL_FVP_DATA` preloads extra files into model memory. It holds
+comma-separated entries in the model's own `--data` form,
+`<target>=<file>@<address>`, for example
+`ros.board.dram=/path/extra.bin@0x08000000`. Each entry becomes one more
+`--data` option, placed after the driver's own preloads in both boot flows. An
+entry splits at its last `@` and its first `=`, and the address is an unsigned
+integer in Go literal syntax, such as `4096` or `0x1000`. A relative file path
+resolves against the current directory. Every command fails while an entry is
+malformed or names a file that does not exist. The model loads the files each
+time `power ac on` launches it, so they hold for the whole run.
 
 A Fast Models license (`ARMLMD_LICENSE_FILE`) is needed for anything past a
 short evaluation window.

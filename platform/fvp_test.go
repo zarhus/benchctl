@@ -499,6 +499,133 @@ while :; do sleep 0.05; done
 	}
 }
 
+func TestParseFVPData(t *testing.T) {
+	dir := t.TempDir()
+	a := writeImage(t, dir, "a.bin")
+	b := writeImage(t, dir, "b.bin")
+	t.Chdir(dir)
+	for _, tc := range []struct {
+		name, value string
+		want        []string
+	}{
+		{"empty", "", nil},
+		{"one", "ros.board.dram=" + a + "@0x08000000", []string{"ros.board.dram=" + a + "@0x08000000"}},
+		{"several", "ros.board.dram=" + a + "@0x1000,css.sysctrl.scp.cpu=" + b + "@16", []string{
+			"ros.board.dram=" + a + "@0x1000",
+			"css.sysctrl.scp.cpu=" + b + "@16",
+		}},
+		{"relative path", "ros.board.dram=b.bin@0x0", []string{"ros.board.dram=" + b + "@0x0"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseFVPData(tc.value)
+			if err != nil {
+				t.Fatalf("parseFVPData(%q): %v", tc.value, err)
+			}
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Errorf("parseFVPData(%q) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseFVPDataSplitsAtTheLastAtAndTheFirstEquals(t *testing.T) {
+	dir := t.TempDir()
+	odd := writeImage(t, dir, "x=y@z.bin")
+	got, err := parseFVPData("ros.board.dram=" + odd + "@0x10")
+	if err != nil {
+		t.Fatalf("parseFVPData: %v", err)
+	}
+	if want := "ros.board.dram=" + odd + "@0x10"; len(got) != 1 || got[0] != want {
+		t.Errorf("got %q, want [%q]", got, want)
+	}
+}
+
+func TestParseFVPDataRejectsMalformedEntries(t *testing.T) {
+	dir := t.TempDir()
+	a := writeImage(t, dir, "a.bin")
+	for _, entry := range []string{
+		"ros.board.dram=" + a,                     // no address
+		"ros.board.dram" + a + "@0x0",             // no '='
+		"=" + a + "@0x0",                          // empty target
+		"ros.board.dram=@0x0",                     // empty file
+		"ros.board.dram=" + a + "@",               // empty address
+		"ros.board.dram=" + a + "@0xZZ",           // bad address
+		"ros.board.dram=" + a + "@-1",             // negative address
+		"ros.board.dram=" + dir + "/none.bin@0x0", // missing file
+		"ros.board.dram=" + dir + "@0x0",          // directory
+		"ros.board.dram=" + a + "@0x0,",           // trailing empty entry
+	} {
+		_, err := parseFVPData(entry)
+		if err == nil {
+			t.Errorf("parseFVPData(%q): want an error", entry)
+			continue
+		}
+		if !strings.Contains(err.Error(), "BENCHCTL_FVP_DATA") {
+			t.Errorf("parseFVPData(%q) error %q does not name BENCHCTL_FVP_DATA", entry, err)
+		}
+	}
+}
+
+func TestNewFVPRejectsBadFVPData(t *testing.T) {
+	dir := t.TempDir()
+	model := writeScript(t, dir, "model.sh", "#!/bin/sh\n")
+	t.Setenv("BENCHCTL_FVP_WORKDIR", dir)
+	t.Setenv("BENCHCTL_FVP_MODEL", model)
+	t.Setenv("BENCHCTL_FVP_DATA", "ros.board.dram="+filepath.Join(dir, "none.bin")+"@0x0")
+	fv := newFVP(nil, Config{}).(*fvpPlatform)
+	if fv.configErr == nil || !strings.Contains(fv.configErr.Error(), "BENCHCTL_FVP_DATA") {
+		t.Fatalf("configErr = %v, want an error naming BENCHCTL_FVP_DATA", fv.configErr)
+	}
+	if _, err := fv.PowerState(); err == nil {
+		t.Fatal("PowerState should surface the config error")
+	}
+}
+
+// TestStartAppendsFVPDataAfterTheBuiltInPreloads covers both boot flows.
+func TestStartAppendsFVPDataAfterTheBuiltInPreloads(t *testing.T) {
+	for _, flow := range []string{"bl33", "fip"} {
+		t.Run(flow, func(t *testing.T) {
+			dir := t.TempDir()
+			dump := filepath.Join(dir, "argv.txt")
+			model := writeScript(t, dir, "model.sh", `#!/bin/sh
+echo "terminal_ns_uart0: Listening for serial connection on port ${BENCHCTL_FVP_CONSOLE_PORT:-6000}"
+printf '%s\n' "$@" > "`+dump+`"
+trap 'exit 0' TERM
+while :; do sleep 0.05; done
+`)
+			extra := writeImage(t, dir, "extra.bin")
+			t.Setenv("BENCHCTL_FVP_DATA", "ros.board.dram="+extra+"@0x08000000")
+			fv := testPlatform(t, model)
+			var image, lastBuiltIn string
+			if flow == "fip" {
+				image = writeFIP(t, filepath.Join(dir, "build"))
+				lastBuiltIn = "css.sysctrl.rse.cpu=" + resolveFIPComponents(filepath.Dir(image)).rseVM1 + "@0x31080000"
+			} else {
+				image = writeImage(t, dir, "uefi.bin")
+				lastBuiltIn = "ros.board.dram=" + image + "@0x60000000"
+			}
+			if err := fv.FlashWrite(FlashHost, image, false); err != nil {
+				t.Fatalf("FlashWrite: %v", err)
+			}
+			if err := fv.SetACPower(PowerOn); err != nil {
+				t.Fatalf("SetACPower(on): %v", err)
+			}
+			t.Cleanup(func() { _ = fv.SetACPower(PowerOff) })
+
+			got, err := os.ReadFile(dump)
+			if err != nil {
+				t.Fatalf("read recorded argv: %v", err)
+			}
+			args := strings.Split(strings.TrimRight(string(got), "\n"), "\n")
+			n := len(args)
+			want := []string{lastBuiltIn, "--data", "ros.board.dram=" + extra + "@0x08000000"}
+			if n < 3 || strings.Join(args[n-3:], "\n") != strings.Join(want, "\n") {
+				t.Errorf("model argv ends with %q, want %q", args[max(n-3, 0):], want)
+			}
+		})
+	}
+}
+
 // TestStartFailsWhenFirmwareMissing covers the other side of that fix: in
 // the RESET_TO_BL31 flow a missing companion is a configuration error
 // reported before the model is even launched, not a degraded-but-alive

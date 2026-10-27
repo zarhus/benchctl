@@ -103,13 +103,18 @@ type fvpPlatform struct {
 	irisEffectTimeout    time.Duration
 	consoleAttachTimeout time.Duration
 
-	// configErr is set at construction when the board or BENCHCTL_FVP_MODEL is
-	// missing or unusable, and returned by every method rather than only the
-	// ones that happen to touch the bad field: acting on half-resolved
-	// configuration would fail confusingly deeper in, e.g. inside exec.Command
-	// with an empty argv.
+	// configErr is set at construction when the board, BENCHCTL_FVP_MODEL or
+	// BENCHCTL_FVP_DATA is missing or unusable, and returned by every method
+	// rather than only the ones that happen to touch the bad field: acting on
+	// half-resolved configuration would fail confusingly deeper in, e.g.
+	// inside exec.Command with an empty argv.
 	configErr error
 	progress  io.Writer
+
+	// extraData holds the BENCHCTL_FVP_DATA entries, each a
+	// <target>=<file>@<address> value for one more --data option, with the
+	// file path made absolute. start appends them after the built-in preloads.
+	extraData []string
 
 	startGrace    time.Duration // see the startGrace constant
 	shutdownGrace time.Duration // see the irisShutdownGrace constant
@@ -158,7 +163,55 @@ func newFVP(runner exec.Runner, cfg Config) Platform {
 		return fv
 	}
 	fv.modelBin = model
+
+	extra, err := parseFVPData(os.Getenv("BENCHCTL_FVP_DATA"))
+	if err != nil {
+		fv.configErr = err
+		return fv
+	}
+	fv.extraData = extra
 	return fv
+}
+
+// parseFVPData parses BENCHCTL_FVP_DATA: comma-separated entries in the
+// model's own --data form, <target>=<file>@<address>. The entry splits at its
+// last '@' and then at the first '='. The target must be non-empty, the
+// address must parse as an unsigned integer in any base strconv.ParseUint
+// accepts, and the file must exist. A relative file path resolves against the
+// current directory. The result holds one --data value per entry, with the
+// path made absolute. An empty value yields no entries.
+func parseFVPData(value string) ([]string, error) {
+	if value == "" {
+		return nil, nil
+	}
+	var out []string
+	for _, entry := range strings.Split(value, ",") {
+		at := strings.LastIndex(entry, "@")
+		if at < 0 {
+			return nil, fmt.Errorf("BENCHCTL_FVP_DATA entry %q: want <target>=<file>@<address>", entry)
+		}
+		head, addr := entry[:at], entry[at+1:]
+		target, file, ok := strings.Cut(head, "=")
+		if !ok || target == "" || file == "" {
+			return nil, fmt.Errorf("BENCHCTL_FVP_DATA entry %q: want <target>=<file>@<address>", entry)
+		}
+		if _, err := strconv.ParseUint(addr, 0, 64); err != nil {
+			return nil, fmt.Errorf("BENCHCTL_FVP_DATA entry %q: bad address %q: %w", entry, addr, err)
+		}
+		abs, err := filepath.Abs(file)
+		if err != nil {
+			return nil, fmt.Errorf("BENCHCTL_FVP_DATA entry %q: %w", entry, err)
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return nil, fmt.Errorf("BENCHCTL_FVP_DATA entry %q: %w", entry, err)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("BENCHCTL_FVP_DATA entry %q: %s is a directory", entry, abs)
+		}
+		out = append(out, target+"="+abs+"@"+addr)
+	}
+	return out, nil
 }
 
 func envOr(key, def string) string {
@@ -672,6 +725,11 @@ func (fv *fvpPlatform) start() error {
 	}
 
 	argv = append(argv, preload...)
+	// BENCHCTL_FVP_DATA entries load after the built-in preloads, in both
+	// boot flows.
+	for _, d := range fv.extraData {
+		argv = append(argv, "--data", d)
+	}
 
 	cmd := osexec.Command(argv[0], argv[1:]...)
 	cmd.Stdout = logFile
